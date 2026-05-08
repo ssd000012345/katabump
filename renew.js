@@ -381,15 +381,54 @@ async function attemptTurnstileCdp(page) {
             }
 
             // ==================== 【只改这里】改进的 See 查找逻辑 ====================
-            console.log('Waiting for "See" link...');
+            console.log('Waiting for "See" link... Current URL:', page.url());
             try {
-                const seeLink = page.locator('a[href*="edit?id="], a:has-text("See"), a:has-text("查看")').first();
-                await seeLink.waitFor({ timeout: 20000 });
-                await page.waitForTimeout(1500);
-                console.log('✅ Found "See" link, clicking...');
-                await seeLink.click();
+                // 更强壮的多选择器版本
+                const seeSelectors = [
+                    'a:has-text("See")',
+                    'a:has-text("查看")',
+                    'a:has-text("编辑")',
+                    `a[href*="edit?id=${user.serverId || '266194'}"]`,
+                    'a[href*="servers/edit"]',
+                    'a[title*="Edit"], a[title*="编辑"]'
+                ];
+
+                let clicked = false;
+                for (const sel of seeSelectors) {
+                    console.log(`Trying selector: ${sel}`);
+                    const link = page.locator(sel).first();
+                    if (await link.count() > 0) {
+                        await link.waitFor({ state: 'visible', timeout: 20000 });
+                        await page.waitForTimeout(1500);
+                        console.log(`✅ Found with selector: ${sel}`);
+                        await link.click({ timeout: 10000 });
+                        clicked = true;
+                        break;
+                    }
+                }
+
+                if (!clicked) {
+                    console.log('⚠️ All selectors failed, using direct navigation fallback...');
+                    const serverId = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
+                    const editUrl = `https://dashboard.katabump.com/servers/edit?id=${serverId}`;
+                    console.log(`→ Direct goto: ${editUrl}`);
+                    await page.goto(editUrl, { 
+                        waitUntil: 'networkidle', 
+                        timeout: 30000 
+                    });
+                    await page.waitForTimeout(5000);
+                }
+
+                // 截图记录
+                const photoDir = path.join(__dirname, 'photo');
+                if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                await page.screenshot({ 
+                    path: path.join(photoDir, `${user.username}_after_see_${Date.now()}.png`), 
+                    fullPage: true 
+                });
+
             } catch (e) {
-                console.log('Could not find "See" button. Trying fallback...');
+                console.error('See link handling error:', e.message);
                 try {
                     const serverId = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
                     await page.goto(`https://dashboard.katabump.com/servers/edit?id=${serverId}`, { waitUntil: 'networkidle' });
