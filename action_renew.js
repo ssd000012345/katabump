@@ -38,7 +38,60 @@ if (HTTP_PROXY) {
     } catch (e) { process.exit(1); }
 }
 
-// ==================== 免费代理池 ====================
+const INJECTED_SCRIPT = `
+(function() {
+    if (window.self === window.top) {
+        const da = () => {
+            const w = document.querySelector('altcha-widget');
+            if (w && w.shadowRoot) { const cb = w.shadowRoot.querySelector('.altcha-checkbox'); if (cb) { const r = cb.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { window.__turnstile_data = { xRatio: (r.left + r.width/2) / window.innerWidth, yRatio: (r.top + r.height/2) / window.innerHeight, type: 'altcha' }; return true; } } }
+            return false;
+        };
+        if (!da()) { let c = 0; const iv = setInterval(() => { if (da() || c++ > 120) clearInterval(iv); }, 500); }
+        return;
+    }
+    try { function ri(m,M){return Math.floor(Math.random()*(M-m+1))+m;} Object.defineProperty(MouseEvent.prototype,'screenX',{value:ri(800,1200)}); Object.defineProperty(MouseEvent.prototype,'screenY',{value:ri(400,600)}); } catch(e){}
+    try {
+        const orig = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function(i) {
+            const sr = orig.call(this, i);
+            if (sr) { const ck = () => { const cb = sr.querySelector('input[type="checkbox"]'); if (cb) { const r = cb.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { window.__turnstile_data = { xRatio: (r.left + r.width/2) / window.innerWidth, yRatio: (r.top + r.height/2) / window.innerHeight }; return true; } } return false; }; if (!ck()) { const ob = new MutationObserver(() => { if (ck()) ob.disconnect(); }); ob.observe(sr, { childList: true, subtree: true }); } }
+            return sr;
+        };
+    } catch(e) {}
+})();
+`;
+
+function checkPort(p) { return new Promise(r => { const req = http.get(`http://localhost:${p}/json/version`, () => r(true)); req.on('error', () => r(false)); req.end(); }); }
+
+async function checkProxy() {
+    if (!currentProxy?.server) return true;
+    try { const u = new URL(currentProxy.server); await axios.get('https://www.google.com', { proxy: { protocol: 'http', host: u.hostname, port: parseInt(u.port) }, timeout: 8000 }); return true; } catch (e) { return false; }
+}
+
+async function launchChrome() {
+    if (await checkPort(DEBUG_PORT)) return;
+    const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=1280,720', '--no-sandbox', '--disable-setuid-sandbox', '--user-data-dir=/tmp/chrome_user_data', '--disable-dev-shm-usage'];
+    if (currentProxy?.server) { args.push(`--proxy-server=${currentProxy.server}`); args.push('--proxy-bypass-list=<-loopback>'); }
+    spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' }).unref();
+    for (let i = 0; i < 20; i++) { if (await checkPort(DEBUG_PORT)) break; await new Promise(r => setTimeout(r, 1000)); }
+    if (!await checkPort(DEBUG_PORT)) throw new Error('Chrome 启动失败');
+}
+
+async function killChrome() {
+    try { exec('pkill -f "chrome.*9222"'); } catch (e) {}
+    for (let i = 0; i < 15; i++) { if (!(await checkPort(DEBUG_PORT))) break; await new Promise(r => setTimeout(r, 1000)); }
+}
+
+async function safeGoto(page, url, label) {
+    try {
+        await page.goto(url, { waitUntil: 'load', timeout: 15000 });
+        return true;
+    } catch (e) {
+        console.log(`   [${label}] 网络错误: ${e.message.substring(0, 80)}`);
+        return false;
+    }
+}
+
 async function fetchFreeProxies() {
     const sources = [
         { name: 'proxyscrape', url: 'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all' },
@@ -62,7 +115,7 @@ async function testProxy(proxyUrl) {
     try { const u = new URL(proxyUrl); await axios.get('https://www.google.com', { proxy: { protocol: 'http', host: u.hostname, port: parseInt(u.port) }, timeout: 8000 }); return true; } catch (e) { return false; }
 }
 
-async function switchToProxy(page, browser) {
+async function switchToProxy(oldBrowser, oldPage) {
     if (freeProxyPool.length === 0) freeProxyPool = await fetchFreeProxies();
     while (freeProxyPool.length > 0) {
         const proxyUrl = freeProxyPool.shift();
@@ -70,20 +123,20 @@ async function switchToProxy(page, browser) {
         if (!(await testProxy(proxyUrl))) { console.log(`   [代理切换] 不可用`); continue; }
 
         console.log(`   [代理切换] ✅ ${proxyUrl} 可用`);
-
         const u = new URL(proxyUrl);
         currentProxy = { server: `${u.protocol}//${u.hostname}:${u.port}` };
 
-        // 杀旧 Chrome
-        try { await browser.close(); } catch (e) {}
-        try { exec('pkill -f "chrome.*9222"'); } catch (e) {}
-        for (let i = 0; i < 15; i++) { if (!(await checkPort(DEBUG_PORT))) break; await new Promise(r => setTimeout(r, 1000)); }
-
-        // 用已有函数启动新 Chrome
+        // 杀旧 Chrome，重启
+        try { await oldBrowser.close(); } catch (e) {}
+        await killChrome();
         await launchChrome();
 
         // 重连
-        browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+        let browser, page;
+        try {
+            browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
+        } catch (e) { console.log('   重连失败'); continue; }
+
         const ctx = browser.contexts()[0];
         page = ctx.pages().length > 0 ? ctx.pages()[0] : await ctx.newPage();
         page.setDefaultTimeout(60000);
@@ -91,36 +144,22 @@ async function switchToProxy(page, browser) {
         else await ctx.setHTTPCredentials(null);
         await page.addInitScript(INJECTED_SCRIPT);
 
+        // 测试代理是否真的能访问目标网站
+        console.log('   [代理切换] 测试目标网站连通性...');
+        if (!(await safeGoto(page, 'https://dashboard.katabump.com/auth/login', '代理测试'))) {
+            console.log('   [代理切换] 代理无法访问目标，换下一个');
+            try { await browser.close(); } catch (e) {}
+            await killChrome();
+            continue;
+        }
+        await page.waitForTimeout(2000);
+
         console.log(`   [代理切换] 完成: ${currentProxy.server}`);
         return { page, browser, ok: true };
     }
     console.log('   [代理切换] 池耗尽');
-    return { page, browser, ok: false };
+    return { page: oldPage, browser: oldBrowser, ok: false };
 }
-// ==================================================
-
-const INJECTED_SCRIPT = `
-(function() {
-    if (window.self === window.top) {
-        const da = () => {
-            const w = document.querySelector('altcha-widget');
-            if (w && w.shadowRoot) { const cb = w.shadowRoot.querySelector('.altcha-checkbox'); if (cb) { const r = cb.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { window.__turnstile_data = { xRatio: (r.left + r.width/2) / window.innerWidth, yRatio: (r.top + r.height/2) / window.innerHeight, type: 'altcha' }; return true; } } }
-            return false;
-        };
-        if (!da()) { let c = 0; const iv = setInterval(() => { if (da() || c++ > 120) clearInterval(iv); }, 500); }
-        return;
-    }
-    try { function ri(m,M){return Math.floor(Math.random()*(M-m+1))+m;} Object.defineProperty(MouseEvent.prototype,'screenX',{value:ri(800,1200)}); Object.defineProperty(MouseEvent.prototype,'screenY',{value:ri(400,600)}); } catch(e){}
-    try {
-        const orig = Element.prototype.attachShadow;
-        Element.prototype.attachShadow = function(i) {
-            const sr = orig.call(this, i);
-            if (sr) { const ck = () => { const cb = sr.querySelector('input[type="checkbox"]'); if (cb) { const r = cb.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { window.__turnstile_data = { xRatio: (r.left + r.width/2) / window.innerWidth, yRatio: (r.top + r.height/2) / window.innerHeight }; return true; } } return false; }; if (!ck()) { const ob = new MutationObserver(() => { if (ck()) ob.disconnect(); }); ob.observe(sr, { childList: true, subtree: true }); } }
-            return sr;
-        };
-    } catch(e) {}
-})();
-`;
 
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
@@ -158,23 +197,123 @@ async function solveAltchaByAPI(page) { try { if ((await getAltchaState(page)) =
 async function solveAltcha(page) { if (!(await hasAltchaWidget(page))) return false; if (await solveAltchaByClick(page)) return true; return await solveAltchaByAPI(page); }
 
 async function findAndClickSeeButton(page) {
-    const strategies = [() => page.getByRole('link', { name: 'See' }).first(), () => page.locator('a[href*="servers/edit"]').first(), () => page.locator('a').filter({ hasText: 'See' }).first(), () => page.locator('a[aria-label*="See"]').first()];
-    for (let i = 0; i < 10; i++) { for (const g of strategies) { try { const l = g(); if (await l.isVisible({ timeout: 1500 })) { await l.click({ timeout: 5000 }); return true; } } catch (e) {} } await page.waitForTimeout(1200); }
+    const strategies = [
+        () => page.getByRole('link', { name: 'See' }).first(),
+        () => page.locator('a[href*="servers/edit"]').first(),
+        () => page.locator('a').filter({ hasText: 'See' }).first(),
+        () => page.locator('a[aria-label*="See"]').first()
+    ];
+    for (let i = 0; i < 10; i++) {
+        for (const g of strategies) {
+            try { const l = g(); if (await l.isVisible({ timeout: 1500 })) { await l.click({ timeout: 5000 }); return true; } } catch (e) {}
+        }
+        await page.waitForTimeout(1200);
+    }
     return false;
 }
-async function navigateToServerEdit(page, user) { const sid = user.serverId || process.env.KATABUMP_SERVER_ID || '266194'; await page.goto(`https://dashboard.katabump.com/servers/edit?id=${sid}`, { waitUntil: 'networkidle', timeout: 30000 }); await page.waitForTimeout(3000); }
 
-function getUsers() { try { if (process.env.USERS_JSON) { const p = JSON.parse(process.env.USERS_JSON); if (Array.isArray(p)) return p; if (p?.users) return p.users; } } catch (e) {} return []; }
-async function checkProxy() { if (!currentProxy?.server) return true; try { const u = new URL(currentProxy.server); const ac = { proxy: { protocol: 'http', host: u.hostname, port: parseInt(u.port) }, timeout: 8000 }; await axios.get('https://www.google.com', ac); return true; } catch (e) { return false; } }
-function checkPort(p) { return new Promise(r => { const req = http.get(`http://localhost:${p}/json/version`, () => r(true)); req.on('error', () => r(false)); req.end(); }); }
+async function navigateToServerEdit(page, user) {
+    const sid = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
+    await page.goto(`https://dashboard.katabump.com/servers/edit?id=${sid}`, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(3000);
+}
 
-async function launchChrome() {
-    if (await checkPort(DEBUG_PORT)) return;
-    const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=1280,720', '--no-sandbox', '--disable-setuid-sandbox', '--user-data-dir=/tmp/chrome_user_data', '--disable-dev-shm-usage'];
-    if (currentProxy?.server) { args.push(`--proxy-server=${currentProxy.server}`); args.push('--proxy-bypass-list=<-loopback>'); }
-    spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' }).unref();
-    for (let i = 0; i < 20; i++) { if (await checkPort(DEBUG_PORT)) break; await new Promise(r => setTimeout(r, 1000)); }
-    if (!await checkPort(DEBUG_PORT)) throw new Error('Chrome 启动失败');
+function getUsers() {
+    try {
+        if (process.env.USERS_JSON) {
+            const p = JSON.parse(process.env.USERS_JSON);
+            if (Array.isArray(p)) return p;
+            if (p?.users) return p.users;
+        }
+    } catch (e) {}
+    return [];
+}
+
+// 核心登录流程
+async function doLogin(page, user, shotDir, safeUser, userIdx) {
+    for (let la = 1; la <= 3; la++) {
+        console.log(`\n[登录尝试 ${la}/3]${currentProxy ? ' [代理: ' + currentProxy.server + ']' : ' [无代理]'}`);
+        if (page.url().includes('dashboard')) { if (!(await safeGoto(page, 'https://dashboard.katabump.com/auth/logout', 'logout'))) return null; await page.waitForTimeout(1500); }
+        if (!(await safeGoto(page, 'https://dashboard.katabump.com/auth/login', 'login'))) {
+            console.log('   网络不通，换代理...');
+            return null;
+        }
+        await page.waitForTimeout(2000);
+        if (page.url().includes('dashboard')) { await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500); if (!(await safeGoto(page, 'https://dashboard.katabump.com/auth/login', 'login2'))) return null; await page.waitForTimeout(2000); }
+
+        try {
+            const ei = page.getByRole('textbox', { name: 'Email' }); await ei.waitFor({ state: 'visible', timeout: 5000 }); await ei.fill(user.username);
+            await page.getByRole('textbox', { name: 'Password' }).fill(user.password); await page.waitForTimeout(500);
+
+            if (await hasAltchaWidget(page)) { await solveAltcha(page); }
+            else { let c = false; for (let t = 0; t < 18; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(800); } if (c) await page.waitForTimeout(2500); }
+
+            await page.getByRole('button', { name: 'Login', exact: true }).click(); await page.waitForTimeout(3500);
+
+            if (await page.getByText('Please complete captcha').isVisible({ timeout: 3000 }).catch(() => false)) { console.log(`   >> ⚠️ 验证码未通过（${la}/3）`); await page.reload(); await page.waitForTimeout(2000); continue; }
+            if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 3000 }).catch(() => false)) { console.error('   >> ❌ 密码错误'); return 'badpass'; }
+            if (page.url().includes('dashboard')) { console.log('   >> ✅ 登录成功！'); return 'ok'; }
+            if (page.url().includes('login') || page.url().includes('auth')) { console.log(`   >> 仍在登录页（${la}/3）`); await page.reload(); await page.waitForTimeout(2000); continue; }
+            await page.reload(); await page.waitForTimeout(2000);
+        } catch (e) { console.log('登录错误:', e.message); }
+    }
+    return 'captcha';
+}
+
+// 核心 Renew 流程
+async function doRenew(page, user, shotDir, safeUser, userIdx) {
+    for (let attempt = 1; attempt <= 20; attempt++) {
+        const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+        try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {}
+        if (!(await renewBtn.isVisible())) { console.log('未找到 Renew。'); return 'done'; }
+        await renewBtn.click();
+        const modal = page.locator('#renew-modal');
+        try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { continue; }
+        try { const box = await modal.boundingBox(); if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 }); } catch (e) {}
+
+        if (await hasAltchaWidget(page)) { await solveAltcha(page); }
+        else { let c = false; for (let t = 0; t < 25; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(1000); } if (c) await page.waitForTimeout(2500); }
+
+        const confirmBtn = modal.getByRole('button', { name: 'Renew' });
+        if (!(await confirmBtn.isVisible())) { await page.reload(); await page.waitForTimeout(3000); continue; }
+        try { await page.screenshot({ path: path.join(shotDir, `${safeUser}_modal_${attempt}.png`), fullPage: true }); } catch (e) {}
+        await confirmBtn.click(); await page.waitForTimeout(3000);
+
+        if (await page.getByText('Please complete the captcha to continue').isVisible({ timeout: 2000 }).catch(() => false)) { await page.reload(); await page.waitForTimeout(3000); continue; }
+        const notTimeLoc = page.getByText("You can't renew your server yet");
+        if (await notTimeLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
+            const text = await notTimeLoc.innerText(); const m = text.match(/as of\s+(.*?)\s+\(/); const ds = m ? m[1] : 'Unknown';
+            console.log(`   >> ⏳ 暂无法续期。下次: ${ds}`);
+            try { const cb = modal.getByLabel('Close'); if (await cb.isVisible()) await cb.click(); } catch (e) {}
+            return { status: 'skip', date: ds };
+        }
+        if (!(await modal.isVisible({ timeout: 1000 }).catch(() => false))) { console.log('   >> ✅ 续期成功！'); return { status: 'success' }; }
+        await page.reload(); await page.waitForTimeout(3000);
+    }
+    return 'done';
+}
+
+// 处理单个用户
+async function processUser(page, user, shotDir, userIdx) {
+    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+    const result = { idx: userIdx, status: 'unknown', date: null };
+
+    const loginResult = await doLogin(page, user, shotDir, safeUser, userIdx);
+    if (loginResult === 'badpass') { result.status = 'badpass'; return result; }
+    if (loginResult === 'captcha' || loginResult === null) { result.status = 'captcha'; return result; }
+
+    if (!(await findAndClickSeeButton(page))) { await navigateToServerEdit(page, user); }
+
+    const renewResult = await doRenew(page, user, shotDir, safeUser, userIdx);
+    if (typeof renewResult === 'object') {
+        result.status = renewResult.status;
+        result.date = renewResult.date;
+    } else {
+        result.status = renewResult;
+    }
+
+    try { await page.screenshot({ path: path.join(shotDir, `${safeUser}.png`), fullPage: true }); } catch (e) {}
+    return result;
 }
 
 (async () => {
@@ -201,134 +340,50 @@ async function launchChrome() {
 
     let needProxyRetry = [];
 
+    // 第一轮：无代理
     for (let i = 0; i < users.length; i++) {
-        const user = users[i];
-        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
         console.log(`\n=== 处理用户 ${i + 1}/${users.length} ===`);
+        const result = await processUser(page, users[i], shotDir, i);
+        console.log(`用户${i + 1}: ${result.status}${result.date ? ' ' + result.date : ''}`);
 
-        try {
-            if (page.isClosed()) { page = await context.newPage(); await page.addInitScript(INJECTED_SCRIPT); }
-
-            let loginSuccess = false;
-            for (let la = 1; la <= 3; la++) {
-                console.log(`\n[登录尝试 ${la}/3]${currentProxy ? ' [代理]' : ' [无代理]'}`);
-                if (page.url().includes('dashboard')) { await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500); }
-                await page.goto('https://dashboard.katabump.com/auth/login'); await page.waitForTimeout(2000);
-                if (page.url().includes('dashboard')) { await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500); await page.goto('https://dashboard.katabump.com/auth/login'); await page.waitForTimeout(2000); }
-
-                try {
-                    const ei = page.getByRole('textbox', { name: 'Email' }); await ei.waitFor({ state: 'visible', timeout: 5000 }); await ei.fill(user.username);
-                    await page.getByRole('textbox', { name: 'Password' }).fill(user.password); await page.waitForTimeout(500);
-
-                    if (await hasAltchaWidget(page)) { await solveAltcha(page); }
-                    else { let c = false; for (let t = 0; t < 18; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(800); } if (c) await page.waitForTimeout(2500); }
-
-                    await page.getByRole('button', { name: 'Login', exact: true }).click(); await page.waitForTimeout(3500);
-
-                    if (await page.getByText('Please complete captcha').isVisible({ timeout: 3000 }).catch(() => false)) { console.log(`   >> ⚠️ 验证码未通过（${la}/3）`); await page.reload(); await page.waitForTimeout(2000); continue; }
-                    if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 3000 }).catch(() => false)) { console.error('   >> ❌ 密码错误'); loginSuccess = false; break; }
-                    if (page.url().includes('dashboard')) { loginSuccess = true; console.log('   >> ✅ 登录成功！'); break; }
-                    if (page.url().includes('login') || page.url().includes('auth')) { console.log(`   >> 仍在登录页（${la}/3）`); await page.reload(); await page.waitForTimeout(2000); continue; }
-                    console.log(`   >> 状态未知`); await page.reload(); await page.waitForTimeout(2000);
-                } catch (e) { console.log('登录错误:', e.message); }
-            }
-
-            if (!loginSuccess && !currentProxy) { needProxyRetry.push(i); console.log('   >> 无代理失败，稍后切换代理重试...'); continue; }
-            if (!loginSuccess) { console.log('   >> 登录最终失败，跳过。'); continue; }
-
-            if (!(await findAndClickSeeButton(page))) { console.log('   >> See 未找到，兜底...'); await navigateToServerEdit(page, user); }
-
-            for (let attempt = 1; attempt <= 20; attempt++) {
-                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-                try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {}
-                if (!(await renewBtn.isVisible())) { console.log('未找到 Renew。'); break; }
-                await renewBtn.click();
-                const modal = page.locator('#renew-modal');
-                try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { continue; }
-                try { const box = await modal.boundingBox(); if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 }); } catch (e) {}
-
-                if (await hasAltchaWidget(page)) { await solveAltcha(page); }
-                else { let c = false; for (let t = 0; t < 25; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(1000); } if (c) await page.waitForTimeout(2500); }
-
-                const confirmBtn = modal.getByRole('button', { name: 'Renew' });
-                if (!(await confirmBtn.isVisible())) { await page.reload(); await page.waitForTimeout(3000); continue; }
-                try { await page.screenshot({ path: path.join(shotDir, `${safeUser}_modal_${attempt}.png`), fullPage: true }); } catch (e) {}
-                await confirmBtn.click(); await page.waitForTimeout(3000);
-
-                if (await page.getByText('Please complete the captcha to continue').isVisible({ timeout: 2000 }).catch(() => false)) { await page.reload(); await page.waitForTimeout(3000); continue; }
-                const notTimeLoc = page.getByText("You can't renew your server yet");
-                if (await notTimeLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
-                    const text = await notTimeLoc.innerText(); const m = text.match(/as of\s+(.*?)\s+\(/); const ds = m ? m[1] : 'Unknown';
-                    console.log(`   >> ⏳ 暂无法续期。下次: ${ds}`);
-                    try { const cb = modal.getByLabel('Close'); if (await cb.isVisible()) await cb.click(); } catch (e) {}
-                    break;
-                }
-                if (!(await modal.isVisible({ timeout: 1000 }).catch(() => false))) { console.log('   >> ✅ 续期成功！'); break; }
-                await page.reload(); await page.waitForTimeout(3000);
-            }
-        } catch (err) { console.error('出错:', err.message); }
-        try { await page.screenshot({ path: path.join(shotDir, `${safeUser}.png`), fullPage: true }); } catch (e) {}
-        console.log(`用户${i + 1}完成\n`);
+        if (result.status === 'badpass') {
+            await sendTelegramMessage(`❌ *登录失败*\n用户${i + 1}: 密码错误`);
+        } else if (result.status === 'success') {
+            await sendTelegramMessage(`✅ *续期成功*\n用户${i + 1}`);
+        } else if (result.status === 'skip') {
+            await sendTelegramMessage(`⏳ *暂无法续期*\n用户${i + 1}: ${result.date}`);
+        } else if (result.status === 'captcha') {
+            needProxyRetry.push(i);
+            console.log('   >> 无代理Turnstile失败，加入代理重试');
+        }
     }
 
-    // ==================== 代理重试 ====================
+    // 第二轮：代理重试
     if (needProxyRetry.length > 0) {
         console.log(`\n===== ${needProxyRetry.length} 个用户需代理重试 =====`);
-        const result = await switchToProxy(page, browser);
-        if (!result.ok) { console.log('代理切换失败'); await sendTelegramMessage('❌ *代理切换失败*'); }
-        else {
-            page = result.page; browser = result.browser;
+        await sendTelegramMessage(`🔄 *切换代理重试*\n无代理失败 ${needProxyRetry.length} 个`);
+
+        const result = await switchToProxy(browser, page);
+        if (!result.ok) {
+            console.log('代理切换失败');
+            await sendTelegramMessage('❌ *代理切换失败*');
+        } else {
+            page = result.page;
+            browser = result.browser;
+            await sendTelegramMessage(`✅ *代理已切换*\n${currentProxy.server}`);
 
             for (const idx of needProxyRetry) {
-                const user = users[idx];
-                const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
                 console.log(`\n=== [代理重试] 用户 ${idx + 1} ===`);
+                const r = await processUser(page, users[idx], shotDir, idx);
+                console.log(`用户${idx + 1}: ${r.status}${r.date ? ' ' + r.date : ''}`);
 
-                let loginSuccess = false;
-                for (let la = 1; la <= 3; la++) {
-                    if (page.url().includes('dashboard')) { await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500); }
-                    await page.goto('https://dashboard.katabump.com/auth/login'); await page.waitForTimeout(2000);
-                    if (page.url().includes('dashboard')) { await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500); await page.goto('https://dashboard.katabump.com/auth/login'); await page.waitForTimeout(2000); }
-                    try {
-                        const ei = page.getByRole('textbox', { name: 'Email' }); await ei.waitFor({ state: 'visible', timeout: 5000 }); await ei.fill(user.username);
-                        await page.getByRole('textbox', { name: 'Password' }).fill(user.password); await page.waitForTimeout(500);
-                        if (await hasAltchaWidget(page)) { await solveAltcha(page); }
-                        else { let c = false; for (let t = 0; t < 18; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(800); } if (c) await page.waitForTimeout(2500); }
-                        await page.getByRole('button', { name: 'Login', exact: true }).click(); await page.waitForTimeout(3500);
-                        if (await page.getByText('Please complete captcha').isVisible({ timeout: 3000 }).catch(() => false)) { console.log(`   >> ⚠️ 验证码未通过（${la}/3）`); await page.reload(); await page.waitForTimeout(2000); continue; }
-                        if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 3000 }).catch(() => false)) { loginSuccess = false; break; }
-                        if (page.url().includes('dashboard')) { loginSuccess = true; console.log('   >> ✅ 代理登录成功！'); break; }
-                        await page.reload(); await page.waitForTimeout(2000);
-                    } catch (e) { console.log('登录错误:', e.message); }
+                if (r.status === 'success') {
+                    await sendTelegramMessage(`✅ *代理续期成功*\n用户${idx + 1}`);
+                } else if (r.status === 'skip') {
+                    await sendTelegramMessage(`⏳ *暂无法续期(代理)*\n用户${idx + 1}: ${r.date}`);
+                } else {
+                    await sendTelegramMessage(`❌ *代理也失败*\n用户${idx + 1}: ${r.status}`);
                 }
-                if (!loginSuccess) continue;
-
-                if (!(await findAndClickSeeButton(page))) await navigateToServerEdit(page, user);
-
-                for (let attempt = 1; attempt <= 20; attempt++) {
-                    const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-                    try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {}
-                    if (!(await renewBtn.isVisible())) break;
-                    await renewBtn.click();
-                    const modal = page.locator('#renew-modal');
-                    try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { continue; }
-                    if (await hasAltchaWidget(page)) { await solveAltcha(page); }
-                    else { let c = false; for (let t = 0; t < 25; t++) { if (await attemptTurnstileCdp(page)) { c = true; break; } await page.waitForTimeout(1000); } if (c) await page.waitForTimeout(2500); }
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
-                    if (!(await confirmBtn.isVisible())) { await page.reload(); await page.waitForTimeout(3000); continue; }
-                    await confirmBtn.click(); await page.waitForTimeout(3000);
-                    if (await page.getByText('Please complete the captcha to continue').isVisible({ timeout: 2000 }).catch(() => false)) { await page.reload(); await page.waitForTimeout(3000); continue; }
-                    const notTimeLoc = page.getByText("You can't renew your server yet");
-                    if (await notTimeLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
-                        const text = await notTimeLoc.innerText(); const m = text.match(/as of\s+(.*?)\s+\(/); const ds = m ? m[1] : 'Unknown';
-                        console.log(`   >> ⏳ 暂无法续期。下次: ${ds}`);
-                        try { const cb = modal.getByLabel('Close'); if (await cb.isVisible()) await cb.click(); } catch (e) {}
-                        break;
-                    }
-                    if (!(await modal.isVisible({ timeout: 1000 }).catch(() => false))) { console.log('   >> ✅ 续期成功！'); break; }
-                    await page.reload(); await page.waitForTimeout(3000);
-                }
-                try { await page.screenshot({ path: path.join(shotDir, `${safeUser}_proxy.png`), fullPage: true }); } catch (e) {}
             }
         }
     }
