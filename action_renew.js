@@ -64,7 +64,7 @@ if (HTTP_PROXY) {
     }
 }
 
-// --- INJECTED_SCRIPT：同时支持 Turnstile (iframe) 和 ALTCHA (主 frame) ---
+// --- INJECTED_SCRIPT：支持 Turnstile (iframe) 和 ALTCHA (主 frame) ---
 const INJECTED_SCRIPT = `
 (function() {
     // 1. 模拟鼠标屏幕坐标
@@ -88,7 +88,6 @@ const INJECTED_SCRIPT = `
             
             if (shadowRoot) {
                 const checkAndReport = () => {
-                    // Turnstile: input[type="checkbox"]
                     let checkbox = shadowRoot.querySelector('input[type="checkbox"]');
                     if (checkbox) {
                         const rect = checkbox.getBoundingClientRect();
@@ -99,7 +98,6 @@ const INJECTED_SCRIPT = `
                             return true;
                         }
                     }
-                    // ALTCHA: .altcha-checkbox (div)
                     let altchaCheckbox = shadowRoot.querySelector('.altcha-checkbox');
                     if (altchaCheckbox) {
                         const rect = altchaCheckbox.getBoundingClientRect();
@@ -250,6 +248,60 @@ function getUsers() {
     return [];
 }
 
+// ==================== 核心修复：正确读取 ALTCHA 状态 ====================
+/**
+ * 正确读取 ALTCHA widget 的当前状态
+ * data-state 在 Shadow DOM 内部的 .altcha div 上，不在 <altcha-widget> 元素上
+ */
+async function getAltchaState(page) {
+    return await page.evaluate(() => {
+        const widget = document.querySelector('altcha-widget');
+        if (!widget) return null;
+        // 方法1：ALTCHA 的公开 API getState()
+        if (typeof widget.getState === 'function') {
+            const s = widget.getState();
+            if (s) return s;
+        }
+        // 方法2：Shadow DOM 内的 .altcha 容器
+        const inner = widget.shadowRoot?.querySelector('.altcha');
+        if (inner) {
+            const state = inner.getAttribute('data-state');
+            if (state) return state;
+        }
+        // 方法3：自定义元素上的 data-state 属性
+        const attr = widget.getAttribute('data-state');
+        if (attr) return attr;
+        return null;
+    });
+}
+
+/**
+ * 检查当前页面是否有 ALTCHA widget
+ */
+async function hasAltchaWidget(page) {
+    return await page.evaluate(() => !!document.querySelector('altcha-widget'));
+}
+
+/**
+ * 等待 ALTCHA 变为 verified，最多 timeoutSec 秒
+ */
+async function waitForAltchaVerified(page, timeoutSec = 12) {
+    for (let sec = 0; sec < timeoutSec; sec++) {
+        const state = await getAltchaState(page);
+        if (state === 'verified') {
+            console.log('   >> ALTCHA: ✅ verified!');
+            return true;
+        }
+        if (state === 'error') {
+            console.log('   >> ALTCHA: ❌ error state.');
+            return false;
+        }
+        await page.waitForTimeout(1000);
+    }
+    return false;
+}
+// =====================================================================
+
 /**
  * CDP 点击 — 支持 iframe (Turnstile) 和主 frame (ALTCHA)
  */
@@ -263,15 +315,14 @@ async function attemptTurnstileCdp(page) {
             const isAltcha = (data.type === 'altcha');
             const isMainFrame = (frame === page.mainFrame());
 
-            console.log(`>> 在 ${isMainFrame ? '主 frame' : 'iframe'} 中发现 ${isAltcha ? 'ALTCHA' : 'Turnstile'}。`);
+            console.log(`>> 在 ${isMainFrame ? '主 frame' : 'iframe'} 发现 ${isAltcha ? 'ALTCHA' : 'Turnstile'}。`);
 
-            // 主 frame ALTCHA
             if (isMainFrame && isAltcha) {
                 const viewport = page.viewportSize();
                 if (!viewport) continue;
                 const clickX = viewport.width * data.xRatio;
                 const clickY = viewport.height * data.yRatio;
-                console.log(`>> [ALTCHA] 点击坐标: (${clickX.toFixed(1)}, ${clickY.toFixed(1)})`);
+                console.log(`>> [ALTCHA CDP] 点击 (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
 
                 const client = await page.context().newCDPSession(page);
                 await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: clickX, y: clickY });
@@ -279,12 +330,11 @@ async function attemptTurnstileCdp(page) {
                 await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
                 await new Promise(r => setTimeout(r, 80));
                 await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-                console.log('>> CDP 点击已发送 (ALTCHA)。');
+                console.log('>> CDP 点击已发送。');
                 await client.detach();
                 return true;
             }
 
-            // iframe Turnstile
             const iframeElement = await frame.frameElement();
             if (!iframeElement) continue;
             const box = await iframeElement.boundingBox();
@@ -292,13 +342,13 @@ async function attemptTurnstileCdp(page) {
 
             const clickX = box.x + (box.width * data.xRatio);
             const clickY = box.y + (box.height * data.yRatio);
-            console.log(`>> [Turnstile] 点击坐标: (${clickX.toFixed(1)}, ${clickY.toFixed(1)})`);
+            console.log(`>> [Turnstile CDP] 点击 (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
 
             const client = await page.context().newCDPSession(page);
             await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
             await new Promise(r => setTimeout(r, 80));
             await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-            console.log('>> CDP 点击已发送 (Turnstile)。');
+            console.log('>> CDP 点击已发送。');
             await client.detach();
             return true;
         } catch (e) {}
@@ -307,114 +357,138 @@ async function attemptTurnstileCdp(page) {
 }
 
 /**
- * ALTCHA 方案一：调用 widget.verify() JS API
+ * ALTCHA 方案一：Playwright 原生点击 .altcha-checkbox（实测最可靠）
  */
-async function solveAltchaViaAPI(page) {
-    console.log('   >> [ALTCHA API] 尝试 widget.verify()...');
-    for (let attempt = 0; attempt < 30; attempt++) {
-        const result = await page.evaluate(() => {
-            const widget = document.querySelector('altcha-widget');
-            if (!widget) return { status: 'no-widget' };
-            const state = widget.getAttribute('data-state');
-            if (state === 'verified') return { status: 'already-verified' };
-            if (typeof widget.verify === 'function') {
-                try { widget.verify(); return { status: 'triggered' }; }
-                catch (e) { return { status: 'error', message: e.message }; }
+async function solveAltchaByClick(page) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            // 先检查是否已经 verified
+            const currentState = await getAltchaState(page);
+            if (currentState === 'verified') {
+                console.log('   >> [点击] ALTCHA 已验证，跳过。');
+                return true;
             }
-            return { status: 'no-method' };
-        });
 
-        if (result.status === 'already-verified') { console.log('   >> [ALTCHA API] 已验证！'); return true; }
-        if (result.status === 'triggered') {
-            console.log('   >> [ALTCHA API] verify() 已调用。等待 PoW 计算...');
-            for (let wait = 0; wait < 25; wait++) {
+            const checkbox = page.locator('.altcha-checkbox').first();
+            if (await checkbox.count() === 0) {
+                if (attempt === 0) console.log('   >> [点击] .altcha-checkbox 未找到。');
                 await page.waitForTimeout(1000);
-                const state = await page.evaluate(() => {
-                    const w = document.querySelector('altcha-widget');
-                    return w ? w.getAttribute('data-state') : null;
-                });
-                if (state === 'verified') { console.log('   >> [ALTCHA API] ✅ 验证成功！'); return true; }
-                if (state === 'error') { console.log('   >> [ALTCHA API] ❌ 错误状态。'); return false; }
+                continue;
             }
-            console.log('   >> [ALTCHA API] 超时。'); return false;
+
+            const box = await checkbox.boundingBox();
+            if (!box || box.width === 0) {
+                await page.waitForTimeout(500);
+                continue;
+            }
+
+            console.log(`   >> [点击] 点击 .altcha-checkbox (${box.x.toFixed(0)}, ${box.y.toFixed(0)})`);
+            await checkbox.click({ timeout: 3000 });
+            console.log('   >> [点击] 已点击，等待验证...');
+
+            if (await waitForAltchaVerified(page, 10)) return true;
+            // 即使 waitForAltchaVerified 返回 false，也不一定失败
+            // 重新检查一次状态
+            const s = await getAltchaState(page);
+            if (s === 'verified' || s === 'verifying') {
+                console.log(`   >> [点击] 当前状态: ${s}，继续。`);
+                return true;
+            }
+            return false;
+        } catch (e) {
+            console.log(`   >> [点击] 错误: ${e.message}`);
+        }
+        await page.waitForTimeout(500);
+    }
+    return false;
+}
+
+/**
+ * ALTCHA 方案二：调用 widget.verify() JS API
+ */
+async function solveAltchaByAPI(page) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const currentState = await getAltchaState(page);
+            if (currentState === 'verified') {
+                console.log('   >> [API] ALTCHA 已验证，跳过。');
+                return true;
+            }
+
+            const triggered = await page.evaluate(() => {
+                const w = document.querySelector('altcha-widget');
+                if (w && typeof w.verify === 'function') {
+                    w.verify();
+                    return true;
+                }
+                return false;
+            });
+
+            if (triggered) {
+                console.log('   >> [API] verify() 已调用，等待...');
+                if (await waitForAltchaVerified(page, 12)) return true;
+            }
+            return false;
+        } catch (e) {
+            console.log(`   >> [API] 错误: ${e.message}`);
         }
         await page.waitForTimeout(1000);
     }
-    console.log('   >> [ALTCHA API] 未找到 widget。');
     return false;
 }
 
 /**
- * ALTCHA 方案二：CDP 点击 Shadow DOM 中的 .altcha-checkbox
- */
-async function solveAltchaViaCdp(page) {
-    console.log('   >> [ALTCHA CDP] 尝试 CDP 点击 .altcha-checkbox...');
-    for (let attempt = 0; attempt < 30; attempt++) {
-        try {
-            const widget = page.locator('altcha-widget').first();
-            if (await widget.count() === 0) { await page.waitForTimeout(1000); continue; }
-            const state = await widget.getAttribute('data-state');
-            if (state === 'verified') { console.log('   >> [ALTCHA CDP] 已验证！'); return true; }
-
-            const checkbox = widget.locator('.altcha-checkbox');
-            if (await checkbox.count() === 0) { await page.waitForTimeout(1000); continue; }
-            const box = await checkbox.boundingBox();
-            if (!box || box.width === 0) { await page.waitForTimeout(1000); continue; }
-
-            const clickX = box.x + box.width / 2;
-            const clickY = box.y + box.height / 2;
-            console.log(`   >> [ALTCHA CDP] 点击 (${clickX.toFixed(1)}, ${clickY.toFixed(1)})`);
-
-            const client = await page.context().newCDPSession(page);
-            await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: clickX, y: clickY });
-            await new Promise(r => setTimeout(r, 50));
-            await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-            await new Promise(r => setTimeout(r, 80));
-            await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-            await client.detach();
-
-            console.log('   >> [ALTCHA CDP] 点击已发送。等待验证...');
-            for (let wait = 0; wait < 20; wait++) {
-                await page.waitForTimeout(1000);
-                const ns = await widget.getAttribute('data-state');
-                if (ns === 'verified') { console.log('   >> [ALTCHA CDP] ✅ 验证成功！'); return true; }
-                if (ns === 'error') { console.log('   >> [ALTCHA CDP] ❌ 错误。'); return false; }
-            }
-            return false;
-        } catch (e) { console.log(`   >> [ALTCHA CDP] 错误: ${e.message}`); }
-        await page.waitForTimeout(1000);
-    }
-    return false;
-}
-
-/**
- * 综合 ALTCHA：API → CDP 降级
+ * 综合 ALTCHA 解决：点击优先（最可靠）→ API → CDP
  */
 async function solveAltcha(page) {
-    if (await solveAltchaViaAPI(page)) return true;
-    if (await solveAltchaViaCdp(page)) return true;
+    const present = await hasAltchaWidget(page);
+    if (!present) return false;
+
+    console.log('   >> 检测到 ALTCHA widget。');
+
+    // 1. Playwright 点击（实测最可靠）
+    if (await solveAltchaByClick(page)) return true;
+
+    // 2. JS API
+    console.log('   >> 点击未成功，尝试 API...');
+    if (await solveAltchaByAPI(page)) return true;
+
+    // 3. CDP 点击（备选）
+    console.log('   >> API 未成功，尝试 CDP...');
+    for (let fa = 0; fa < 3; fa++) {
+        if (await attemptTurnstileCdp(page)) {
+            if (await waitForAltchaVerified(page, 10)) return true;
+            break;
+        }
+        await page.waitForTimeout(1000);
+    }
+
+    // 最终检查
+    const finalState = await getAltchaState(page);
+    if (finalState === 'verified' || finalState === 'verifying') {
+        console.log(`   >> 最终状态: ${finalState}，视为成功。`);
+        return true;
+    }
+
     return false;
 }
 
 /**
- * 等待验证完成（Turnstile Success 或 ALTCHA verified）
+ * 等待 Cloudflare Turnstile 显示 Success
  */
-async function waitForCaptchaVerified(page, timeoutSec = 15) {
+async function waitForTurnstileSuccess(page, timeoutSec = 10) {
     for (let sec = 0; sec < timeoutSec; sec++) {
         const frames = page.frames();
         for (const f of frames) {
             if (f.url().includes('cloudflare')) {
-                try { if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) { console.log('   >> Cloudflare: Success!'); return true; } }
-                catch (e) {}
+                try {
+                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                        console.log('   >> Cloudflare Turnstile: Success!');
+                        return true;
+                    }
+                } catch (e) {}
             }
         }
-        try {
-            const state = await page.evaluate(() => {
-                const w = document.querySelector('altcha-widget');
-                return w ? w.getAttribute('data-state') : null;
-            });
-            if (state === 'verified') { console.log('   >> ALTCHA: verified!'); return true; }
-        } catch (e) {}
         await page.waitForTimeout(1000);
     }
     return false;
@@ -503,19 +577,19 @@ async function waitForCaptchaVerified(page, timeoutSec = 15) {
                 await pwdInput.fill(user.password);
                 await page.waitForTimeout(500);
 
-                // === 登录前 Captcha：ALTCHA 优先 ===
-                console.log('   >> 正在检查登录前验证码 (ALTCHA + Turnstile)...');
-                let captchaSolved = await solveAltcha(page);
-                if (!captchaSolved) {
-                    console.log('   >> ALTCHA 未检测到，尝试 Turnstile CDP...');
+                // === 登录前 Captcha ===
+                console.log('   >> 检查登录前验证码...');
+                const hasAltchaLogin = await hasAltchaWidget(page);
+                if (hasAltchaLogin) {
+                    console.log('   >> 登录页检测到 ALTCHA。');
+                    await solveAltcha(page);
+                } else {
+                    console.log('   >> 登录页无 ALTCHA，尝试 Turnstile CDP...');
                     for (let fa = 0; fa < 15; fa++) {
-                        if (await attemptTurnstileCdp(page)) { captchaSolved = true; break; }
+                        if (await attemptTurnstileCdp(page)) break;
                         await page.waitForTimeout(1000);
                     }
-                }
-                if (captchaSolved) {
-                    console.log('   >> 验证码已处理。等待验证完成...');
-                    await waitForCaptchaVerified(page, 15);
+                    await waitForTurnstileSuccess(page, 10);
                 }
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
@@ -573,37 +647,26 @@ async function waitForCaptchaVerified(page, timeoutSec = 15) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) {}
 
-                    // === ALTCHA + Turnstile ===
-                    console.log('正在检查验证码 (ALTCHA + Turnstile)...');
-                    let captchaSolved = await solveAltcha(page);
+                    // === 智能验证码处理 ===
+                    console.log('正在检查验证码...');
+                    const hasAltchaModal = await hasAltchaWidget(page);
 
-                    if (!captchaSolved) {
-                        console.log('   >> ALTCHA 未检测到/未解决，尝试 Turnstile CDP...');
-                        for (let fa = 0; fa < 15; fa++) {
-                            if (await attemptTurnstileCdp(page)) { captchaSolved = true; break; }
-                            console.log(`   >> [寻找尝试 ${fa + 1}/15]...`);
+                    if (hasAltchaModal) {
+                        // ALTCHA 路径（精简版，不再浪费 Turnstile 尝试）
+                        console.log('   >> 检测到 ALTCHA，直接解决...');
+                        await solveAltcha(page);
+                    } else {
+                        // Turnstile 路径（登录页/旧版）
+                        console.log('   >> 无 ALTCHA，尝试 Turnstile CDP...');
+                        for (let fa = 0; fa < 5; fa++) {
+                            if (await attemptTurnstileCdp(page)) break;
                             await page.waitForTimeout(1000);
                         }
+                        await waitForTurnstileSuccess(page, 10);
                     }
 
-                    if (!captchaSolved) {
-                        console.log('   >> CDP 失败，尝试 Playwright locator 兜底...');
-                        try {
-                            const altchaCheckbox = page.locator('.altcha-checkbox').first();
-                            if (await altchaCheckbox.count() > 0 && await altchaCheckbox.isVisible({ timeout: 2000 })) {
-                                console.log('   >> ✅ .altcha-checkbox 找到，点击中...');
-                                await altchaCheckbox.click({ timeout: 5000 });
-                                captchaSolved = true;
-                                await page.waitForTimeout(3000);
-                                await waitForCaptchaVerified(page, 10);
-                            }
-                        } catch (e) { console.log('   >> Playwright 兜底错误:', e.message); }
-                    }
-
-                    if (captchaSolved) {
-                        console.log('   >> 验证码已解决。等待...');
-                        await page.waitForTimeout(5000);
-                    }
+                    console.log('   >> 验证码处理完成，等待 3 秒...');
+                    await page.waitForTimeout(3000);
 
                     const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     if (await confirmBtn.isVisible()) {
