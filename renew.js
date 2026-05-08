@@ -13,9 +13,9 @@ const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 const USER_DATA_DIR = path.join(__dirname, 'ChromeData_Katabump');
 const DEBUG_PORT = 9222;
 const HEADLESS = false;
-
+// const HTTP_PROXY = ""
 // --- Proxy Configuration ---
-const HTTP_PROXY = process.env.HTTP_PROXY;
+const HTTP_PROXY = process.env.HTTP_PROXY; // e.g., http://user:pass@1.2.3.4:8080 or http://1.2.3.4:8080
 let PROXY_CONFIG = null;
 
 if (HTTP_PROXY) {
@@ -33,11 +33,16 @@ if (HTTP_PROXY) {
     }
 }
 
+
 // --- injected.js 核心逻辑 ---
+// 这个脚本会被注入到每个 Frame 中。它劫持 attachShadow 以捕获 Turnstile 的 checkbox，
+// 计算其相对于 Frame 视口的位置比例，并存入 window.__turnstile_data 供外部读取。
 const INJECTED_SCRIPT = `
 (function() {
+    // 只在 iframe 中运行（Turnstile 通常在 iframe 里）
     if (window.self === window.top) return;
 
+    // 1. 模拟鼠标屏幕坐标 (尝试保留这个优化)
     try {
         function getRandomInt(min, max) {
             return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -47,8 +52,11 @@ const INJECTED_SCRIPT = `
         
         Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
         Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-    } catch (e) { }
+    } catch (e) { 
+        // 忽略错误，如果不允许修改也没关系，不影响主流程
+    }
 
+    // 2. 简单的 attachShadow Hook (回退到这个版本，确保能找到元素)
     try {
         const originalAttachShadow = Element.prototype.attachShadow;
         
@@ -57,12 +65,16 @@ const INJECTED_SCRIPT = `
             
             if (shadowRoot) {
                 const checkAndReport = () => {
+                    // 尝试在 Shadow Root 中查找 checkbox
                     const checkbox = shadowRoot.querySelector('input[type="checkbox"]');
                     if (checkbox) {
                         const rect = checkbox.getBoundingClientRect();
+                        // 确保元素已渲染且可见
                         if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
                             const xRatio = (rect.left + rect.width / 2) / window.innerWidth;
                             const yRatio = (rect.top + rect.height / 2) / window.innerHeight;
+                            
+                            // 暴露数据给 Playwright
                             window.__turnstile_data = { xRatio, yRatio };
                             return true;
                         }
@@ -70,7 +82,9 @@ const INJECTED_SCRIPT = `
                     return false;
                 };
 
+                // 立即检查一次
                 if (!checkAndReport()) {
+                    // 如果没找到，监听 DOM 变化
                     const observer = new MutationObserver(() => {
                         if (checkAndReport()) observer.disconnect();
                     });
@@ -85,9 +99,10 @@ const INJECTED_SCRIPT = `
 })();
 `;
 
-// 辅助函数
+// 辅助函数：检测代理是否可用
 async function checkProxy() {
     if (!PROXY_CONFIG) return true;
+
     console.log('[Proxy] Validating proxy connection...');
     try {
         const axiosConfig = {
@@ -98,12 +113,15 @@ async function checkProxy() {
             },
             timeout: 10000
         };
+
         if (PROXY_CONFIG.username && PROXY_CONFIG.password) {
             axiosConfig.proxy.auth = {
                 username: PROXY_CONFIG.username,
                 password: PROXY_CONFIG.password
             };
         }
+
+        // 尝试访问一个可靠的测试地址 (Cloudflare Trace 或者 Google)
         await axios.get('https://www.google.com', axiosConfig);
         console.log('[Proxy] Connection successful!');
         return true;
@@ -113,6 +131,7 @@ async function checkProxy() {
     }
 }
 
+// 辅助函数：检测端口是否开放
 function checkPort(port) {
     return new Promise((resolve) => {
         const req = http.get(`http://localhost:${port}/json/version`, (res) => {
@@ -123,6 +142,7 @@ function checkPort(port) {
     });
 }
 
+// 辅助函数：启动原生 Chrome
 async function launchNativeChrome() {
     console.log('Checking if Chrome is already running on port ' + DEBUG_PORT + '...');
     if (await checkPort(DEBUG_PORT)) {
@@ -139,7 +159,10 @@ async function launchNativeChrome() {
     ];
 
     if (PROXY_CONFIG) {
+        // Chrome 命令行只接受 server 地址，认证需要在 playright 层或者插件层处理
+        // 这里我们要 strip 掉 username:password
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
+        // 确保 Chrome 自身请求 localhost (如 CDP) 不走代理
         args.push('--proxy-bypass-list=<-loopback>');
     }
 
@@ -161,10 +184,14 @@ async function launchNativeChrome() {
 
     if (!await checkPort(DEBUG_PORT)) {
         console.error('Chrome failed to start on port ' + DEBUG_PORT);
+        if (!checkPort(DEBUG_PORT)) {
+            try { chrome.kill(); } catch (e) { }
+        }
         throw new Error('Chrome launch failed');
     }
 }
 
+// 从 login.json 读取用户列表
 function getUsers() {
     try {
         const data = fs.readFileSync(path.join(__dirname, 'login.json'), 'utf8');
@@ -176,25 +203,37 @@ function getUsers() {
     }
 }
 
+/**
+ * 核心功能：遍历所有 Frames，查找被注入脚本标记的 Turnstile 坐标，
+ * 计算绝对屏幕坐标，并使用 CDP 发送原生鼠标点击事件。
+ */
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
         try {
+            // 检查当前 Frame 是否捕获到了 Turnstile 数据
             const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
+
             if (data) {
                 console.log('>> Found Turnstile in frame. Ratios:', data);
+
+                // 获取 iframe 元素在主页面中的位置
                 const iframeElement = await frame.frameElement();
                 if (!iframeElement) continue;
+
                 const box = await iframeElement.boundingBox();
                 if (!box) continue;
 
+                // 计算绝对坐标：iframe 左上角 + (iframe 宽/高 * 比例)
                 const clickX = box.x + (box.width * data.xRatio);
                 const clickY = box.y + (box.height * data.yRatio);
 
                 console.log(`>> Calculated absolute click coordinates: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
 
+                // 创建 CDP 会话并发送点击命令
                 const client = await page.context().newCDPSession(page);
 
+                // 1. Mouse Pressed
                 await client.send('Input.dispatchMouseEvent', {
                     type: 'mousePressed',
                     x: clickX,
@@ -203,8 +242,10 @@ async function attemptTurnstileCdp(page) {
                     clickCount: 1
                 });
 
+                // 模拟人类点击持续时间 (50ms - 150ms)
                 await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
 
+                // 2. Mouse Released
                 await client.send('Input.dispatchMouseEvent', {
                     type: 'mouseReleased',
                     x: clickX,
@@ -215,14 +256,15 @@ async function attemptTurnstileCdp(page) {
 
                 console.log('>> CDP Click sent successfully.');
                 await client.detach();
-                return true;
+                return true; // 成功点击
             }
-        } catch (e) {}
+        } catch (e) {
+            // 忽略 Frame 访问错误（跨域等）
+        }
     }
     return false;
 }
 
-// ====================== 主程序 ======================
 (async () => {
     const users = getUsers();
     if (users.length === 0) {
@@ -230,6 +272,7 @@ async function attemptTurnstileCdp(page) {
         return;
     }
 
+    // 检查代理有效性
     if (PROXY_CONFIG) {
         const isValid = await checkProxy();
         if (!isValid) {
@@ -262,14 +305,20 @@ async function attemptTurnstileCdp(page) {
     let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
 
+    // --- 代理认证处理 ---
     if (PROXY_CONFIG && PROXY_CONFIG.username) {
         console.log('[Proxy] Setting up authentication...');
         await context.setHTTPCredentials({
             username: PROXY_CONFIG.username,
             password: PROXY_CONFIG.password
         });
+    } else {
+        // 如果没有代理(或者代理无认证)，清除之前的认证信息，防止干扰
+        await context.setHTTPCredentials(null);
     }
 
+    // --- 关键：注入 Hook 脚本 ---
+    // 这会在每次页面加载/导航前执行，确保能拦截到 Turnstile 的创建
     await page.addInitScript(INJECTED_SCRIPT);
     console.log('Injection script added to page context.');
 
@@ -280,18 +329,25 @@ async function attemptTurnstileCdp(page) {
         try {
             if (page.isClosed()) {
                 page = await context.newPage();
-                await page.addInitScript(INJECTED_SCRIPT);
+                // Context credentials should persist, no need to re-auth per page
+                await page.addInitScript(INJECTED_SCRIPT); // 新页面也要注入
             }
 
-            // 登录逻辑
+            // 登录逻辑保持不变...
             console.log('Checking session state...');
             if (page.url().includes('/auth/login')) {
+                // Already on login logic
             } else if (page.url().includes('dashboard')) {
                 await page.goto('https://dashboard.katabump.com/auth/logout');
                 await page.waitForTimeout(2000);
             } else {
                 await page.goto('https://dashboard.katabump.com/auth/login');
                 await page.waitForTimeout(2000);
+                if (page.url().includes('dashboard')) {
+                    await page.goto('https://dashboard.katabump.com/auth/logout');
+                    await page.waitForTimeout(2000);
+                    await page.goto('https://dashboard.katabump.com/auth/login');
+                }
             }
 
             console.log('Filling credentials...');
@@ -303,61 +359,88 @@ async function attemptTurnstileCdp(page) {
                 await pwdInput.fill(user.password);
                 await page.waitForTimeout(500);
 
-                console.log('   >> Checking for Turnstile before login...');
+                // --- Cloudflare Turnstile Bypass for Login ---
+                console.log('   >> Checking for Turnstile before login (using CDP bypass)...');
                 let cdpClickResult = false;
                 for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
                     cdpClickResult = await attemptTurnstileCdp(page);
                     if (cdpClickResult) break;
+                    // console.log(`   >> [Login Find Attempt ${findAttempt + 1}/15] Turnstile checkbox not found yet...`);
                     await page.waitForTimeout(1000);
                 }
 
                 if (cdpClickResult) {
-                    await page.waitForTimeout(8000);
+                    console.log('   >> CDP Click active for login. Waiting up to 10s for Cloudflare success...');
+                    // Wait for the "Success!" mark in any cloudflare frame
+                    for (let waitSec = 0; waitSec < 10; waitSec++) {
+                        const frames = page.frames();
+                        let isSuccess = false;
+                        for (const f of frames) {
+                            if (f.url().includes('cloudflare')) {
+                                try {
+                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                        isSuccess = true;
+                                        break;
+                                    }
+                                } catch (e) { }
+                            }
+                        }
+                        if (isSuccess) {
+                            console.log('   >> Turnstile verification successful before login.');
+                            break;
+                        }
+                        await page.waitForTimeout(1000);
+                    }
+                } else {
+                    console.log('   >> No Turnstile detected or clicked before login, proceeding anyway...');
                 }
+                // --------------------------------------------
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                // 检查登录错误
+                // User Request: Check for "Incorrect password or no account"
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ Login failed for ${user.username}`);
+                        console.error(`   >> ❌ Login failed: Incorrect password or no account for user ${user.username}`);
+
+                        // Screenshot for login failure
+                        const photoDir = path.join(__dirname, 'photo');
+                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                        try { await page.screenshot({ path: path.join(photoDir, `${user.username}.png`), fullPage: true }); } catch (e) { }
+
+                        // Skip to next user
                         continue;
                     }
                 } catch (e) { }
 
             } catch (e) {
+                // 可能已经登录了，或者是其他 UI 状态
                 console.log('Login form interaction error (maybe already logged in?):', e.message);
             }
 
-            // ==================== 【核心修改】See 按钮查找 ====================
             console.log('Waiting for "See" link...');
             try {
-                const seeLink = page.locator('a:has-text("See"), a:has-text("查看"), a[href*="edit?id="], a[href*="servers/edit"]').first();
-                
-                await seeLink.waitFor({ timeout: 25000 });
-                await page.waitForTimeout(1500);
-                
-                console.log('✅ Found "See/查看" link, clicking...');
-                await seeLink.click();
-                await page.waitForTimeout(4000);
+                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
+                await page.waitForTimeout(1000);
+                await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
-                console.log('⚠️ "See" button not found, using fallback...');
-                const serverId = user.serverId || process.env.SERVER_ID || process.env.KATABUMP_SERVER_ID || '266194';
-                const editUrl = `https://dashboard.katabump.com/servers/edit?id=${serverId}`;
-                console.log(`→ Direct navigation to edit page: ${editUrl}`);
-                await page.goto(editUrl, { waitUntil: 'networkidle', timeout: 30000 });
-                await page.waitForTimeout(5000);
+                console.log('Could not find "See" button. Checking if already on detail page or login failed.');
+                if (page.url().includes('login')) {
+                    console.error('Login failed for user ' + user.username);
+                    continue;
+                }
             }
-            // ===============================================================
 
             let renewSuccess = false;
+            // 2. 一个扁平化的主循环：尝试 Renew 整个流程 (最多 20 次)
             for (let attempt = 1; attempt <= 20; attempt++) {
                 let hasCaptchaError = false;
 
                 console.log(`\n[Attempt ${attempt}/20] Looking for Renew button...`);
 
-                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                // 【优化】使用更宽松的选择器查找 Renew 按钮
+                const renewBtn = page.locator('button:has-text("Renew"), button:has-text("续期"), [onclick*="renew"]').first();
                 try {
                     await renewBtn.waitFor({ state: 'visible', timeout: 8000 });
                 } catch (e) { }
@@ -366,31 +449,60 @@ async function attemptTurnstileCdp(page) {
                     await renewBtn.click();
                     console.log('Renew button clicked. Waiting for modal...');
 
-                    const modal = page.locator('#renew-modal');
-                    try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {}
+                    const modal = page.locator('#renew-modal, .modal, div[role="dialog"]').first();
+                    try { await modal.waitFor({ state: 'visible', timeout: 8000 }); } catch (e) {
+                        console.log('Modal did not appear? Retrying...');
+                        continue;
+                    }
 
+                    // A. 在模态框里晃晃鼠标
                     try {
                         const box = await modal.boundingBox();
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    console.log('Checking for Turnstile...');
+                    // B. 加强验证码处理（支持 ALTCHA）
+                    console.log('Checking for ALTCHA / Turnstile...');
                     let cdpClickResult = false;
                     for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
                         cdpClickResult = await attemptTurnstileCdp(page);
                         if (cdpClickResult) break;
+
+                        // ALTCHA 备用点击
+                        try {
+                            const altchaCheckbox = page.locator('input[type="checkbox"], text="I\'m not a robot", .altcha-checkbox').first();
+                            if (await altchaCheckbox.isVisible({ timeout: 1500 })) {
+                                console.log('ALTCHA checkbox found, clicking...');
+                                await altchaCheckbox.click();
+                                cdpClickResult = true;
+                                await page.waitForTimeout(5000);
+                                break;
+                            }
+                        } catch (e) {}
                         await page.waitForTimeout(1000);
                     }
 
                     if (cdpClickResult) {
-                        await page.waitForTimeout(8000);
+                        console.log('   >> Captcha clicked. Waiting...');
+                        await page.waitForTimeout(6000);
+                    } else {
+                        console.log('   >> No captcha detected, proceeding anyway...');
                     }
 
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
+                    // D. 准备点击确认
+                    const confirmBtn = modal.locator('button:has-text("Renew"), button:has-text("续期"), button:has-text("Confirm"), button:has-text("确认")').first();
                     if (await confirmBtn.isVisible()) {
+
+                        // User Requested: Screenshot BEFORE final click
                         const photoDir = path.join(__dirname, 'photo');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        await page.screenshot({ path: path.join(photoDir, `${user.username}_Turnstile_${attempt}.png`), fullPage: true });
+                        const tsScreenshotName = `${user.username}_Turnstile_${attempt}.png`;
+                        try {
+                            await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
+                            console.log(`   >> 📸 Snapshot saved: ${tsScreenshotName}`);
+                        } catch (e) {
+                            console.log('   >> Failed to take Turnstile snapshot:', e.message);
+                        }
 
                         console.log('   >> Clicking Renew confirm button...');
                         await confirmBtn.click();
@@ -399,15 +511,23 @@ async function attemptTurnstileCdp(page) {
                             const startVerifyTime = Date.now();
                             while (Date.now() - startVerifyTime < 4000) {
                                 if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                    console.log('   >> ⚠️ Captcha error detected.');
+                                    console.log('   >> ⚠️ Error detected: "Please complete the captcha".');
                                     hasCaptchaError = true;
                                     break;
                                 }
 
                                 const notTimeLoc = page.getByText("You can't renew your server yet");
                                 if (await notTimeLoc.isVisible()) {
-                                    console.log(`   >> ⏳ Cannot renew yet.`);
+                                    const text = await notTimeLoc.innerText();
+                                    const match = text.match(/as of\s+(.*?)\s+\(/);
+                                    let dateStr = match ? match[1] : 'Unknown Date';
+                                    console.log(`   >> ⏳ Cannot renew yet. Next renewal available as of: ${dateStr}`);
+
                                     renewSuccess = true;
+                                    try {
+                                        const closeBtn = modal.getByLabel('Close');
+                                        if (await closeBtn.isVisible()) await closeBtn.click();
+                                    } catch (e) { }
                                     break;
                                 }
                                 await page.waitForTimeout(300);
@@ -415,25 +535,34 @@ async function attemptTurnstileCdp(page) {
                         } catch (e) { }
 
                         if (renewSuccess) break;
+
                         if (hasCaptchaError) {
+                            console.log('   >> Error found. Refreshing page to reset Turnstile...');
                             await page.reload();
                             await page.waitForTimeout(4000);
                             continue;
                         }
 
                         await page.waitForTimeout(3000);
-                        if (!await modal.isVisible({ timeout: 1000 })) {
-                            console.log('   >> ✅ Renew successful!');
+                        if (!await modal.isVisible()) {
+                            console.log('   >> ✅ Modal closed. Renew successful!');
                             renewSuccess = true;
                             break;
                         } else {
+                            console.log('   >> Modal still open but no error? Weird. Retrying loop...');
                             await page.reload();
                             await page.waitForTimeout(4000);
                             continue;
                         }
+                    } else {
+                        console.log('   >> Verify button inside modal not found? Refreshing...');
+                        await page.reload();
+                        await page.waitForTimeout(3000);
+                        continue;
                     }
+
                 } else {
-                    console.log('Renew button not found. May already be renewed.');
+                    console.log('Renew button not found (Server might be already renewed or page load error).');
                     break;
                 }
             }
@@ -442,18 +571,21 @@ async function attemptTurnstileCdp(page) {
             console.error(`Error processing user ${user.username}:`, err);
         }
 
-        // 最终截图
+        // Snapshot before handling next user (Normal end of loop)
         const photoDir = path.join(__dirname, 'photo');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+        const screenshotPath = path.join(photoDir, `${user.username}.png`);
         try {
-            await page.screenshot({ 
-                path: path.join(photoDir, `${user.username}_final.png`), 
-                fullPage: true 
-            });
-            console.log(`📸 Final screenshot saved for ${user.username}`);
-        } catch (e) {}
+            await page.screenshot({ path: screenshotPath, fullPage: true });
+            console.log(`Saved screenshot to: ${screenshotPath}`);
+        } catch (e) {
+            console.log('Failed to take screenshot:', e.message);
+        }
+
+        console.log(`Finished User ${user.username}\n`);
     }
 
     console.log('All users processed.');
+    console.log('Closing browser connection.');
     await browser.close();
 })();
