@@ -13,13 +13,9 @@ async function sendTelegramMessage(message, imagePath = null) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
     try {
         await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-            chat_id: TG_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown'
+            chat_id: TG_CHAT_ID, text: message, parse_mode: 'Markdown'
         });
-    } catch (e) {
-        console.error('[Telegram] send error:', e.message);
-    }
+    } catch (e) { console.error('[Telegram] send error:', e.message); }
     if (imagePath && fs.existsSync(imagePath)) {
         const cmd = `curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${imagePath}"`;
         await new Promise(r => exec(cmd, () => r()));
@@ -45,7 +41,7 @@ if (HTTP_PROXY) {
     } catch (e) { process.exit(1); }
 }
 
-// ==================== 注入脚本 ====================
+// 注入脚本
 const INJECTED_SCRIPT = `(function() {
     if (window.self === window.top) return;
     try {
@@ -63,10 +59,7 @@ const INJECTED_SCRIPT = `(function() {
                     if (cb) {
                         const r = cb.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0) {
-                            window.__turnstile_data = {
-                                xRatio: (r.left + r.width/2) / window.innerWidth,
-                                yRatio: (r.top + r.height/2) / window.innerHeight
-                            };
+                            window.__turnstile_data = { xRatio: (r.left+r.width/2)/window.innerWidth, yRatio: (r.top+r.height/2)/window.innerHeight };
                             return true;
                         }
                     }
@@ -82,7 +75,7 @@ const INJECTED_SCRIPT = `(function() {
     } catch(e){}
 })();`;
 
-// ==================== CDP 点击 Turnstile ====================
+// CDP 点击 Turnstile
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -93,18 +86,12 @@ async function attemptTurnstileCdp(page) {
                 if (!iframeElement) continue;
                 const box = await iframeElement.boundingBox();
                 if (!box) continue;
-
                 const clickX = box.x + (box.width * data.xRatio);
                 const clickY = box.y + (box.height * data.yRatio);
-
                 const client = await page.context().newCDPSession(page);
-                await client.send('Input.dispatchMouseEvent', {
-                    type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1
-                });
+                await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
                 await new Promise(r => setTimeout(r, 80 + Math.random() * 120));
-                await client.send('Input.dispatchMouseEvent', {
-                    type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1
-                });
+                await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
                 await client.detach();
                 return true;
             }
@@ -113,26 +100,20 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
-// ==================== ALTCHA 处理 ====================
+// ALTCHA
 async function hasAltchaWidget(page) {
     return await page.evaluate(() => !!document.querySelector('altcha-widget'));
 }
-
 async function getAltchaState(page) {
     return await page.evaluate(() => {
         const w = document.querySelector('altcha-widget');
         if (!w) return null;
-        if (typeof w.getState === 'function') {
-            const s = w.getState(); if (s) return s;
-        }
+        if (typeof w.getState === 'function') { const s = w.getState(); if (s) return s; }
         const i = w.shadowRoot?.querySelector('.altcha');
-        if (i) {
-            const s = i.getAttribute('data-state'); if (s) return s;
-        }
+        if (i) { const s = i.getAttribute('data-state'); if (s) return s; }
         return w.getAttribute('data-state');
     });
 }
-
 async function waitForAltchaVerified(page) {
     for (let s = 0; s < 15; s++) {
         const st = await getAltchaState(page);
@@ -142,7 +123,6 @@ async function waitForAltchaVerified(page) {
     }
     return false;
 }
-
 async function solveAltcha(page) {
     if (!(await hasAltchaWidget(page))) return false;
     for (let a = 0; a < 8; a++) {
@@ -167,7 +147,7 @@ async function solveAltcha(page) {
     return false;
 }
 
-// ==================== 稳定查找 See 按钮 ====================
+// 稳定找 See 按钮
 async function findAndClickSeeButton(page) {
     const strategies = [
         () => page.getByRole('link', { name: 'See' }).first(),
@@ -190,36 +170,23 @@ async function findAndClickSeeButton(page) {
     return false;
 }
 
-// ==================== getUsers（已修复） ====================
+// getUsers（已修复）
 function getUsers() {
     try {
         if (process.env.USERS_JSON) {
             const parsed = JSON.parse(process.env.USERS_JSON);
             if (Array.isArray(parsed)) return parsed;
             if (parsed && Array.isArray(parsed.users)) return parsed.users;
-            console.log('[getUsers] USERS_JSON 格式错误');
-            return [];
         }
-    } catch (e) {
-        console.error('解析 USERS_JSON 出错:', e.message);
-        return [];
-    }
-    console.log('[getUsers] 未检测到 USERS_JSON');
+    } catch (e) { console.error('解析USERS_JSON出错:', e.message); }
     return [];
 }
 
-// ==================== 代理 & Chrome 启动 ====================
+// 代理检测
 async function checkProxy() {
     if (!PROXY_CONFIG) return true;
     try {
-        const ac = {
-            proxy: {
-                protocol: 'http',
-                host: new URL(PROXY_CONFIG.server).hostname,
-                port: new URL(PROXY_CONFIG.server).port
-            },
-            timeout: 10000
-        };
+        const ac = { proxy: { protocol: 'http', host: new URL(PROXY_CONFIG.server).hostname, port: new URL(PROXY_CONFIG.server).port }, timeout: 10000 };
         if (PROXY_CONFIG.username) ac.proxy.auth = { username: PROXY_CONFIG.username, password: PROXY_CONFIG.password };
         await axios.get('https://www.google.com', ac);
         return true;
@@ -238,14 +205,9 @@ async function launchChrome() {
     if (await checkPort(DEBUG_PORT)) return;
     const args = [
         `--remote-debugging-port=${DEBUG_PORT}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-gpu',
-        '--window-size=1280,720',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data',
-        '--disable-dev-shm-usage'
+        '--no-first-run', '--no-default-browser-check', '--disable-gpu',
+        '--window-size=1280,720', '--no-sandbox', '--disable-setuid-sandbox',
+        '--user-data-dir=/tmp/chrome_user_data', '--disable-dev-shm-usage'
     ];
     if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
@@ -256,79 +218,54 @@ async function launchChrome() {
         if (await checkPort(DEBUG_PORT)) break;
         await new Promise(r => setTimeout(r, 1000));
     }
-    if (!await checkPort(DEBUG_PORT)) throw new Error('Chrome 启动失败');
+    if (!await checkPort(DEBUG_PORT)) throw new Error('Chrome启动失败');
 }
 
-// ==================== 主流程（完整版） ====================
+// ==================== 主流程 ====================
 (async () => {
     const users = getUsers();
-    if (users.length === 0) {
-        console.log('未找到用户，程序退出');
-        process.exit(1);
-    }
+    if (users.length === 0) { console.log('未找到用户'); process.exit(1); }
 
-    if (PROXY_CONFIG && !(await checkProxy())) {
-        console.error('代理无效，退出');
-        process.exit(1);
-    }
-
+    if (PROXY_CONFIG && !(await checkProxy())) { console.error('代理无效'); process.exit(1); }
     await launchChrome();
 
     let browser;
     for (let k = 0; k < 5; k++) {
         try {
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
-            console.log('Chrome 连接成功');
             break;
-        } catch {
-            await new Promise(r => setTimeout(r, 2000));
-        }
+        } catch { await new Promise(r => setTimeout(r, 2000)); }
     }
-    if (!browser) {
-        console.error('Chrome 连接失败');
-        process.exit(1);
-    }
+    if (!browser) { console.error('连接失败'); process.exit(1); }
 
     const context = browser.contexts()[0];
     let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
 
-    if (PROXY_CONFIG?.username) {
-        await context.setHTTPCredentials({ username: PROXY_CONFIG.username, password: PROXY_CONFIG.password });
-    }
+    if (PROXY_CONFIG?.username) await context.setHTTPCredentials({ username: PROXY_CONFIG.username, password: PROXY_CONFIG.password });
 
     await page.addInitScript(INJECTED_SCRIPT);
 
-    // ==================== 开始全程录制视频 ====================
-    const videoDir = path.join(process.cwd(), 'videos');
     const shotDir = path.join(process.cwd(), 'screenshots');
-    if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
     if (!fs.existsSync(shotDir)) fs.mkdirSync(shotDir, { recursive: true });
-
-    await page.video.startRecording({ dir: videoDir, size: { width: 1280, height: 720 } });
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
-        const serverId = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
         const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-
-        console.log(`\n=== 处理用户 ${i + 1}/${users.length} (ServerID: ${serverId}) ===`);
+        console.log(`\n=== 处理用户 ${i+1}/${users.length} ===`);
 
         try {
             if (page.isClosed()) {
                 page = await context.newPage();
                 await page.addInitScript(INJECTED_SCRIPT);
-                await page.video.startRecording({ dir: videoDir, size: { width: 1280, height: 720 } });
             }
 
             // 登录
             for (let la = 1; la <= 3; la++) {
                 if (page.url().includes('dashboard')) {
-                    await page.goto('https://dashboard.katabump.com/auth/logout');
-                    await page.waitForTimeout(1500);
+                    await page.goto('https://dashboard.katabump.com/auth/logout'); await page.waitForTimeout(1500);
                 }
-                await page.goto('https://dashboard.katabump.com/auth/login');
-                await page.waitForTimeout(2000);
+                await page.goto('https://dashboard.katabump.com/auth/login'); await page.waitForTimeout(2000);
 
                 const emailInput = page.getByRole('textbox', { name: 'Email' });
                 await emailInput.waitFor({ state: 'visible', timeout: 5000 });
@@ -337,10 +274,8 @@ async function launchChrome() {
                 await page.waitForTimeout(500);
 
                 if (await hasAltchaWidget(page)) {
-                    console.log('   >> 检测到 ALTCHA，正在处理...');
                     await solveAltcha(page);
                 } else {
-                    console.log('   >> 正在点击 Cloudflare Turnstile (CDP)...');
                     let clicked = false;
                     for (let t = 0; t < 18; t++) {
                         if (await attemptTurnstileCdp(page)) { clicked = true; break; }
@@ -352,90 +287,57 @@ async function launchChrome() {
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
                 await page.waitForTimeout(3500);
 
-                if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 2000 })) {
-                    console.log('   >> ❌ 密码错误');
-                    break;
-                }
-                if (page.url().includes('dashboard')) {
-                    console.log('   >> ✅ 登录成功');
-                    break;
-                }
+                if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 2000 })) break;
+                if (page.url().includes('dashboard')) break;
             }
 
             if (!page.url().includes('dashboard')) continue;
 
-            // 找 See 按钮
-            console.log('正在寻找 See 按钮...');
+            // See 按钮
             const seeSuccess = await findAndClickSeeButton(page);
-            if (!seeSuccess) {
-                console.log('   >> ❌ 多次尝试仍未找到 See 按钮，跳过');
-                continue;
-            }
+            if (!seeSuccess) continue;
 
-            // Renew 流程
-            let renewSuccess = false;
+            // Renew
             for (let attempt = 1; attempt <= 20; attempt++) {
-                console.log(`\n[尝试 ${attempt}/20] 寻找 Renew 按钮...`);
                 const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
                 try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch {}
 
                 if (await renewBtn.isVisible()) {
                     await renewBtn.click();
-
                     const modal = page.locator('#renew-modal');
                     try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch { continue; }
 
-                    try {
-                        const box = await modal.boundingBox();
-                        if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
-                    } catch {}
-
-                    // 处理验证码
-                    if (await hasAltchaWidget(page)) {
-                        await solveAltcha(page);
-                    } else {
-                        for (let t = 0; t < 30; t++) {
+                    if (await hasAltchaWidget(page)) await solveAltcha(page);
+                    else {
+                        for (let t = 0; t < 25; t++) {
                             if (await attemptTurnstileCdp(page)) break;
                             await page.waitForTimeout(1000);
                         }
-                        await page.waitForTimeout(2500);
+                        await page.waitForTimeout(2000);
                     }
-
-                    await page.waitForTimeout(2000);
 
                     const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     if (await confirmBtn.isVisible()) {
                         await confirmBtn.click();
                         await page.waitForTimeout(3000);
-
                         if (!(await modal.isVisible())) {
                             console.log('   >> ✅ 续期成功');
                             await page.screenshot({ path: path.join(shotDir, `${safeUser}_success.png`), fullPage: true });
                             await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}`);
-                            renewSuccess = true;
                             break;
                         } else {
-                            await page.reload();
-                            await page.waitForTimeout(3000);
-                            continue;
+                            await page.reload(); await page.waitForTimeout(3000); continue;
                         }
                     }
-                } else {
-                    console.log('未找到 Renew 按钮');
-                    break;
-                }
+                } else break;
             }
-        } catch (err) {
-            console.error('处理用户出错:', err);
-        }
+        } catch (err) { console.error('处理出错:', err.message); }
 
-        // 保存截图
-        try {
-            await page.screenshot({ path: path.join(shotDir, `${safeUser}.png`), fullPage: true });
-        } catch (e) {}
+        // 截图
+        try { await page.screenshot({ path: path.join(shotDir, `${safeUser}.png`), fullPage: true }); } catch {}
     }
 
-    console.log('全部用户处理完成');
+    console.log('完成。');
     await browser.close();
     process.exit(0);
 })();
