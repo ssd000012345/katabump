@@ -361,9 +361,14 @@ async function attemptTurnstileCdp(page) {
                                 } catch (e) { }
                             }
                         }
-                        if (isSuccess) break;
+                        if (isSuccess) {
+                            console.log('   >> Turnstile verification successful before login.');
+                            break;
+                        }
                         await page.waitForTimeout(1000);
                     }
+                } else {
+                    console.log('   >> No Turnstile detected or clicked before login, proceeding anyway...');
                 }
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
@@ -371,7 +376,7 @@ async function attemptTurnstileCdp(page) {
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
                     if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ Login failed for user ${user.username}`);
+                        console.error(`   >> ❌ Login failed: Incorrect password or no account for user ${user.username}`);
                         continue;
                     }
                 } catch (e) { }
@@ -380,23 +385,20 @@ async function attemptTurnstileCdp(page) {
                 console.log('Login form interaction error (maybe already logged in?):', e.message);
             }
 
-            // ==================== 【只改这里】改进的 See 查找逻辑 ====================
+            // ==================== 只修改这里：改进的 See 查找逻辑 ====================
             console.log('Waiting for "See" link...');
             try {
+                // 加强版选择器，兼容你页面实际结构
                 const seeLink = page.locator('a[href*="edit?id="], a:has-text("See"), a:has-text("查看")').first();
-                await seeLink.waitFor({ timeout: 20000 });
+                await seeLink.waitFor({ timeout: 25000 });
                 await page.waitForTimeout(1500);
                 console.log('✅ Found "See" link, clicking...');
                 await seeLink.click();
             } catch (e) {
-                console.log('Could not find "See" button. Trying fallback...');
-                try {
-                    const serverId = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
-                    await page.goto(`https://dashboard.katabump.com/servers/edit?id=${serverId}`, { waitUntil: 'networkidle' });
-                    await page.waitForTimeout(4000);
-                } catch (fallbackErr) {
-                    console.log('Fallback also failed.');
-                }
+                console.log('Could not find "See" button. Trying direct navigation...');
+                const serverId = '266194';
+                await page.goto(`https://dashboard.katabump.com/servers/edit?id=${serverId}`, { waitUntil: 'networkidle' });
+                await page.waitForTimeout(4000);
             }
             // =====================================================================
 
@@ -427,19 +429,19 @@ async function attemptTurnstileCdp(page) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // ==================== 【只改这里】加强 ALTCHA 处理 ====================
+                    // ==================== 只修改这里：加强 ALTCHA 处理 ====================
                     console.log('Checking for ALTCHA / Turnstile...');
                     let captchaSolved = false;
-                    for (let findAttempt = 0; findAttempt < 35; findAttempt++) {
+                    for (let findAttempt = 0; findAttempt < 40; findAttempt++) {
                         if (await attemptTurnstileCdp(page)) {
                             captchaSolved = true;
                             break;
                         }
                         try {
-                            const altchaCheckbox = page.locator('input[type="checkbox"], label:has-text("I\'m not a robot"), .altcha-checkbox, text="I\'m not a robot"').first();
+                            const altchaCheckbox = page.locator('input[type="checkbox"], label:has-text("I\'m not a robot"), .altcha-checkbox').first();
                             if (await altchaCheckbox.isVisible({ timeout: 2000 })) {
-                                console.log('✅ ALTCHA "I\'m not a robot" found, clicking...');
-                                await altchaCheckbox.click();
+                                console.log('✅ ALTCHA checkbox found, clicking...');
+                                await altchaCheckbox.click({ force: true });
                                 captchaSolved = true;
                                 await page.waitForTimeout(7000);
                                 break;
@@ -448,12 +450,6 @@ async function attemptTurnstileCdp(page) {
                         await page.waitForTimeout(1000);
                     }
                     // =====================================================================
-
-                    let isTurnstileSuccess = false;
-                    if (captchaSolved) {
-                        console.log('   >> Captcha solved. Waiting...');
-                        await page.waitForTimeout(6000);
-                    }
 
                     const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     if (await confirmBtn.isVisible()) {
