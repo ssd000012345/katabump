@@ -248,44 +248,31 @@ function getUsers() {
     return [];
 }
 
-// ==================== 核心修复：正确读取 ALTCHA 状态 ====================
-/**
- * 正确读取 ALTCHA widget 的当前状态
- * data-state 在 Shadow DOM 内部的 .altcha div 上，不在 <altcha-widget> 元素上
- */
+// ==================== ALTCHA 状态检测 ====================
 async function getAltchaState(page) {
     return await page.evaluate(() => {
         const widget = document.querySelector('altcha-widget');
         if (!widget) return null;
-        // 方法1：ALTCHA 的公开 API getState()
         if (typeof widget.getState === 'function') {
             const s = widget.getState();
             if (s) return s;
         }
-        // 方法2：Shadow DOM 内的 .altcha 容器
         const inner = widget.shadowRoot?.querySelector('.altcha');
         if (inner) {
             const state = inner.getAttribute('data-state');
             if (state) return state;
         }
-        // 方法3：自定义元素上的 data-state 属性
         const attr = widget.getAttribute('data-state');
         if (attr) return attr;
         return null;
     });
 }
 
-/**
- * 检查当前页面是否有 ALTCHA widget
- */
 async function hasAltchaWidget(page) {
     return await page.evaluate(() => !!document.querySelector('altcha-widget'));
 }
 
-/**
- * 等待 ALTCHA 变为 verified，最多 timeoutSec 秒
- */
-async function waitForAltchaVerified(page, timeoutSec = 12) {
+async function waitForAltchaVerified(page, timeoutSec = 10) {
     for (let sec = 0; sec < timeoutSec; sec++) {
         const state = await getAltchaState(page);
         if (state === 'verified') {
@@ -300,11 +287,8 @@ async function waitForAltchaVerified(page, timeoutSec = 12) {
     }
     return false;
 }
-// =====================================================================
 
-/**
- * CDP 点击 — 支持 iframe (Turnstile) 和主 frame (ALTCHA)
- */
+// ==================== CDP 点击（Turnstile iframe + ALTCHA 主 frame） ====================
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -322,7 +306,6 @@ async function attemptTurnstileCdp(page) {
                 if (!viewport) continue;
                 const clickX = viewport.width * data.xRatio;
                 const clickY = viewport.height * data.yRatio;
-                console.log(`>> [ALTCHA CDP] 点击 (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
 
                 const client = await page.context().newCDPSession(page);
                 await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: clickX, y: clickY });
@@ -342,7 +325,6 @@ async function attemptTurnstileCdp(page) {
 
             const clickX = box.x + (box.width * data.xRatio);
             const clickY = box.y + (box.height * data.yRatio);
-            console.log(`>> [Turnstile CDP] 点击 (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
 
             const client = await page.context().newCDPSession(page);
             await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
@@ -356,13 +338,10 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
-/**
- * ALTCHA 方案一：Playwright 原生点击 .altcha-checkbox（实测最可靠）
- */
+// ==================== ALTCHA 解决方案（点击优先） ====================
 async function solveAltchaByClick(page) {
     for (let attempt = 0; attempt < 5; attempt++) {
         try {
-            // 先检查是否已经 verified
             const currentState = await getAltchaState(page);
             if (currentState === 'verified') {
                 console.log('   >> [点击] ALTCHA 已验证，跳过。');
@@ -387,8 +366,6 @@ async function solveAltchaByClick(page) {
             console.log('   >> [点击] 已点击，等待验证...');
 
             if (await waitForAltchaVerified(page, 10)) return true;
-            // 即使 waitForAltchaVerified 返回 false，也不一定失败
-            // 重新检查一次状态
             const s = await getAltchaState(page);
             if (s === 'verified' || s === 'verifying') {
                 console.log(`   >> [点击] 当前状态: ${s}，继续。`);
@@ -403,9 +380,6 @@ async function solveAltchaByClick(page) {
     return false;
 }
 
-/**
- * ALTCHA 方案二：调用 widget.verify() JS API
- */
 async function solveAltchaByAPI(page) {
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -426,7 +400,7 @@ async function solveAltchaByAPI(page) {
 
             if (triggered) {
                 console.log('   >> [API] verify() 已调用，等待...');
-                if (await waitForAltchaVerified(page, 12)) return true;
+                if (await waitForAltchaVerified(page, 10)) return true;
             }
             return false;
         } catch (e) {
@@ -437,23 +411,17 @@ async function solveAltchaByAPI(page) {
     return false;
 }
 
-/**
- * 综合 ALTCHA 解决：点击优先（最可靠）→ API → CDP
- */
 async function solveAltcha(page) {
     const present = await hasAltchaWidget(page);
     if (!present) return false;
 
     console.log('   >> 检测到 ALTCHA widget。');
 
-    // 1. Playwright 点击（实测最可靠）
     if (await solveAltchaByClick(page)) return true;
 
-    // 2. JS API
     console.log('   >> 点击未成功，尝试 API...');
     if (await solveAltchaByAPI(page)) return true;
 
-    // 3. CDP 点击（备选）
     console.log('   >> API 未成功，尝试 CDP...');
     for (let fa = 0; fa < 3; fa++) {
         if (await attemptTurnstileCdp(page)) {
@@ -463,7 +431,6 @@ async function solveAltcha(page) {
         await page.waitForTimeout(1000);
     }
 
-    // 最终检查
     const finalState = await getAltchaState(page);
     if (finalState === 'verified' || finalState === 'verifying') {
         console.log(`   >> 最终状态: ${finalState}，视为成功。`);
@@ -473,9 +440,6 @@ async function solveAltcha(page) {
     return false;
 }
 
-/**
- * 等待 Cloudflare Turnstile 显示 Success
- */
 async function waitForTurnstileSuccess(page, timeoutSec = 10) {
     for (let sec = 0; sec < timeoutSec; sec++) {
         const frames = page.frames();
@@ -493,6 +457,67 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
     }
     return false;
 }
+
+// ==================== 核心：零点击 See 按钮 — 直接从 DOM 提取 URL 导航 ====================
+async function navigateToServerEdit(page, user) {
+    console.log('正在定位服务器编辑页...');
+
+    // 1. 确保已经在 dashboard
+    await page.waitForLoadState('networkidle');
+    await page.waitForTimeout(3000);
+
+    let editUrl = null;
+
+    // 2. 从 DOM 提取 edit URL（零点击，最可靠）
+    try {
+        editUrl = await page.evaluate(() => {
+            // 先找 a[href*="servers/edit"]
+            const links = document.querySelectorAll('a[href*="servers/edit"]');
+            for (const link of links) {
+                if (link.offsetParent !== null) {
+                    return link.href;
+                }
+            }
+            // 再找文本为 "See" 的链接
+            const allLinks = document.querySelectorAll('a');
+            for (const link of allLinks) {
+                if (link.textContent.trim() === 'See' && link.offsetParent !== null) {
+                    return link.href;
+                }
+            }
+            // 再找 "查看" 或 "编辑"
+            for (const link of allLinks) {
+                const t = link.textContent.trim();
+                if ((t === '查看' || t === '编辑') && link.offsetParent !== null) {
+                    return link.href;
+                }
+            }
+            return null;
+        });
+    } catch (e) {
+        console.log('   DOM 提取 URL 出错:', e.message);
+    }
+
+    // 3. 如果提取到了，直接导航
+    if (editUrl) {
+        // 补全相对路径
+        if (!editUrl.startsWith('http')) {
+            editUrl = 'https://dashboard.katabump.com' + (editUrl.startsWith('/') ? '' : '/') + editUrl;
+        }
+        console.log(`→ 提取到 URL: ${editUrl}`);
+        await page.goto(editUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        await page.waitForTimeout(3000);
+        return;
+    }
+
+    // 4. 硬兜底：构造 URL
+    const serverId = user.serverId || process.env.KATABUMP_SERVER_ID || '266194';
+    editUrl = `https://dashboard.katabump.com/servers/edit?id=${serverId}`;
+    console.log(`→ 兜底 URL: ${editUrl}`);
+    await page.goto(editUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(3000);
+}
+// =====================================================================
 
 (async () => {
     const users = getUsers();
@@ -612,15 +637,9 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
                 console.log('登录错误:', e.message);
             }
 
-            console.log('正在寻找 "See" 链接...');
-            try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
-            } catch (e) {
-                console.log('未找到 "See" 按钮。');
-                continue;
-            }
+            // ==================== 零点击 See 按钮 — 直接导航 ====================
+            await navigateToServerEdit(page, user);
+            // =====================================================================
 
             // === Renew 主循环 ===
             let renewSuccess = false;
@@ -652,11 +671,9 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
                     const hasAltchaModal = await hasAltchaWidget(page);
 
                     if (hasAltchaModal) {
-                        // ALTCHA 路径（精简版，不再浪费 Turnstile 尝试）
                         console.log('   >> 检测到 ALTCHA，直接解决...');
                         await solveAltcha(page);
                     } else {
-                        // Turnstile 路径（登录页/旧版）
                         console.log('   >> 无 ALTCHA，尝试 Turnstile CDP...');
                         for (let fa = 0; fa < 5; fa++) {
                             if (await attemptTurnstileCdp(page)) break;
@@ -674,7 +691,7 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
                         const photoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                         const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const tsScreenshotName = `${safeUser}_Turnstile_${attempt}.png`;
+                        const tsScreenshotName = `${safeUser}_modal_${attempt}.png`;
                         try {
                             await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
                             console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
@@ -701,7 +718,7 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
 
                                     const skipShotPath = path.join(photoDir, `${safeUser}_skip.png`);
                                     try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) {}
-                                    await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
+                                    await sendTelegramMessage(`⏳ *暂无法续期*\n用户: ${user.username}\n下次可用: ${dateStr}`, skipShotPath);
 
                                     renewSuccess = true;
                                     try {
@@ -751,7 +768,7 @@ async function waitForTurnstileSuccess(page, timeoutSec = 10) {
                 }
             }
         } catch (err) {
-            console.error(`Error processing user:`, err);
+            console.error(`处理用户出错:`, err);
         }
 
         const photoDir = path.join(process.cwd(), 'screenshots');
