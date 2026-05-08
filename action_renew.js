@@ -120,46 +120,62 @@ async function getAltchaState(page) { return await page.evaluate(() => { const w
 async function hasAltchaWidget(page) { return await page.evaluate(() => !!document.querySelector('altcha-widget')); }
 async function waitForAltchaVerified(page, t = 10) { for (let s = 0; s < t; s++) { const st = await getAltchaState(page); if (st === 'verified') { console.log('   >> ALTCHA: ✅ verified!'); return true; } if (st === 'error') { console.log('   >> ALTCHA: ❌ error'); return false; } await page.waitForTimeout(1000); } return false; }
 
-// ==================== ALTCHA 解决 ====================
 async function solveAltchaByClick(page) { for (let a = 0; a < 5; a++) { try { if ((await getAltchaState(page)) === 'verified') return true; const cb = page.locator('.altcha-checkbox').first(); if (await cb.count() === 0) { await page.waitForTimeout(1000); continue; } const box = await cb.boundingBox(); if (!box || box.width === 0) { await page.waitForTimeout(500); continue; } console.log('   >> [点击] 点击 .altcha-checkbox'); await cb.click({ timeout: 3000 }); if (await waitForAltchaVerified(page, 10)) return true; const s = await getAltchaState(page); if (s === 'verified' || s === 'verifying') return true; return false; } catch (e) { console.log('   >> [点击] 错误:', e.message); } await page.waitForTimeout(500); } return false; }
 async function solveAltchaByAPI(page) { for (let a = 0; a < 3; a++) { try { if ((await getAltchaState(page)) === 'verified') return true; const ok = await page.evaluate(() => { const w = document.querySelector('altcha-widget'); if (w && typeof w.verify === 'function') { w.verify(); return true; } return false; }); if (ok) { console.log('   >> [API] verify() 已调用。'); if (await waitForAltchaVerified(page, 10)) return true; } return false; } catch (e) { console.log('   >> [API] 错误:', e.message); } await page.waitForTimeout(1000); } return false; }
-async function solveAltcha(page) { if (!(await hasAltchaWidget(page))) return false; console.log('   >> 检测到 ALTCHA widget。'); if (await solveAltchaByClick(page)) return true; console.log('   >> 点击未成功，尝试 API...'); if (await solveAltchaByAPI(page)) return true; console.log('   >> API 未成功，尝试 CDP...'); for (let fa = 0; fa < 3; fa++) { if (await attemptTurnstileCdp(page) && await waitForAltchaVerified(page, 10)) return true; await page.waitForTimeout(1000); } const s = await getAltchaState(page); return s === 'verified' || s === 'verifying'; }
+async function solveAltcha(page) { if (!(await hasAltchaWidget(page))) return false; console.log('   >> 检测到 ALTCHA widget。'); if (await solveAltchaByClick(page)) return true; console.log('   >> 点击未成功，尝试 API...'); if (await solveAltchaByAPI(page)) return true; return false; }
 
-// ==================== Turnstile 多策略 ====================
+// ==================== Turnstile（关键修复：等绿色勾，不等假 token） ====================
 
-// CDP 点击（原作者方式，保留作备选）
-async function attemptTurnstileCdp(page) {
-    const frames = page.frames();
-    for (const frame of frames) {
-        try {
-            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
-            if (!data) continue;
-            if (data.type === 'altcha' && frame === page.mainFrame()) {
-                const vp = page.viewportSize(); if (!vp) continue;
-                const cx = vp.width * data.xRatio, cy = vp.height * data.yRatio;
-                const client = await page.context().newCDPSession(page);
-                await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 });
-                await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
-                await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 });
-                await client.detach(); return true;
-            }
-            const iframeElement = await frame.frameElement();
-            if (!iframeElement) continue;
-            const box = await iframeElement.boundingBox();
-            if (!box) continue;
-            const clickX = box.x + (box.width * data.xRatio);
-            const clickY = box.y + (box.height * data.yRatio);
-            const client = await page.context().newCDPSession(page);
-            await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-            await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
-            await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1 });
-            await client.detach(); return true;
-        } catch (e) {}
+// 检测 Turnstile iframe 内是否验证成功（绿色勾 / "Success!" / checkbox 被 checked）
+async function checkTurnstileVerifiedInFrame(frame) {
+    return await frame.evaluate(() => {
+        // 方式1：找 "Success!" 文本
+        const labels = document.querySelectorAll('*');
+        for (const el of labels) {
+            if (el.textContent && el.textContent.trim() === 'Success!') return true;
+        }
+
+        // 方式2：checkbox 有 aria-checked="true" 或被 checked
+        const cb = document.querySelector('input[type="checkbox"]');
+        if (cb) {
+            if (cb.checked || cb.getAttribute('aria-checked') === 'true') return true;
+        }
+
+        // 方式3：找绿色勾（SVG/span 中有 checkmark 的常见 class）
+        const markers = document.querySelectorAll('[class*="check"], [class*="success"], [class*="verified"], [data-status="solved"], [data-state="solved"]');
+        for (const m of markers) {
+            const style = getComputedStyle(m);
+            if (style.display !== 'none' && style.visibility !== 'hidden') return true;
+        }
+
+        return false;
+    });
+}
+
+// 等待 Turnstile 真正验证通过（等绿色勾，不是假 token）
+async function waitForTurnstileVerified(page, timeoutSec = 15) {
+    console.log('   >> 等待 Turnstile 验证...');
+    for (let s = 0; s < timeoutSec; s++) {
+        const frames = page.frames();
+        for (const f of frames) {
+            if (!f.url().includes('cloudflare') && !f.url().includes('turnstile') && !f.url().includes('challenges.cloudflare')) continue;
+            try {
+                const verified = await checkTurnstileVerifiedInFrame(f);
+                if (verified) {
+                    console.log(`   >> ✅ Turnstile 验证通过！(${s + 1}s)`);
+                    // 再等 2 秒让 token 生成
+                    await page.waitForTimeout(2000);
+                    return true;
+                }
+            } catch (e) {}
+        }
+        await page.waitForTimeout(1000);
     }
+    console.log('   >> ⚠️ Turnstile 验证超时');
     return false;
 }
 
-// 策略一：Playwright mouse 模拟真人移动+点击（非 CDP）
+// 鼠标模拟点击（真人轨迹）
 async function attemptTurnstileMouse(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -172,35 +188,24 @@ async function attemptTurnstileMouse(page) {
             if (!box) continue;
             const tx = box.x + (box.width * data.xRatio);
             const ty = box.y + (box.height * data.yRatio);
-
-            // 随机起点（在目标附近）
             const sx = tx - 40 + Math.random() * 80;
             const sy = ty - 30 + Math.random() * 60;
 
-            // 快速移动到起点
             await page.mouse.move(sx, sy);
             await page.waitForTimeout(40 + Math.random() * 80);
 
-            // 减速靠近目标（ease-out 曲线 + 微抖动）
             const steps = 7 + Math.floor(Math.random() * 6);
             for (let i = 1; i <= steps; i++) {
                 const t = i / steps;
                 const ease = 1 - Math.pow(1 - t, 3);
-                const mx = sx + (tx - sx) * ease + (Math.random() - 0.5) * 2;
-                const my = sy + (ty - sy) * ease + (Math.random() - 0.5) * 2;
-                await page.mouse.move(mx, my);
+                await page.mouse.move(sx + (tx - sx) * ease + (Math.random() - 0.5) * 2, sy + (ty - sy) * ease + (Math.random() - 0.5) * 2);
                 await page.waitForTimeout(12 + Math.random() * 30);
             }
-
-            // 悬停
             await page.mouse.move(tx, ty);
             await page.waitForTimeout(60 + Math.random() * 180);
-
-            // 点击
             await page.mouse.down();
             await page.waitForTimeout(40 + Math.random() * 100);
             await page.mouse.up();
-
             console.log(`   >> [Mouse] 点击 (${tx.toFixed(0)}, ${ty.toFixed(0)})`);
             return true;
         } catch (e) {}
@@ -208,7 +213,7 @@ async function attemptTurnstileMouse(page) {
     return false;
 }
 
-// 策略二：iframe 内 dispatchEvent（绕过 isTrusted 检测）
+// iframe 内 dispatchEvent
 async function attemptTurnstileDOM(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -220,24 +225,18 @@ async function attemptTurnstileDOM(page) {
             const box = await iframeEl.boundingBox();
             if (!box) continue;
 
-            // 先移动 Playwright 鼠标到 iframe 中心（让浏览器认为鼠标在那里）
-            const cx = box.x + box.width / 2;
-            const cy = box.y + box.height / 2;
-            await page.mouse.move(cx, cy, { steps: 3 });
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 3 });
             await page.waitForTimeout(100);
 
-            // 在 iframe 内部派发事件
             const clicked = await frame.evaluate((d) => {
                 const checkbox = document.querySelector('input[type="checkbox"]');
                 if (!checkbox) return false;
                 checkbox.focus();
-                // 派发 PointerEvent + MouseEvent
                 checkbox.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true, clientX: d.x, clientY: d.y }));
                 checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: d.x, clientY: d.y }));
                 checkbox.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true, clientX: d.x, clientY: d.y }));
                 checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: d.x, clientY: d.y }));
                 checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: d.x, clientY: d.y }));
-                // 也试一下 native .click()
                 checkbox.click();
                 return true;
             }, { x: box.width * data.xRatio, y: box.height * data.yRatio });
@@ -248,76 +247,27 @@ async function attemptTurnstileDOM(page) {
     return false;
 }
 
-// 获取 Turnstile token（不依赖视觉 "Success!"）
-async function getTurnstileToken(page) {
-    return await page.evaluate(() => {
-        try {
-            if (typeof turnstile !== 'undefined' && turnstile.getResponse) {
-                const t = turnstile.getResponse();
-                if (t) return t;
-            }
-            const input = document.querySelector('input[name="cf-turnstile-response"]');
-            if (input && input.value) return input.value;
-        } catch (e) {}
-        return null;
-    });
-}
-
-async function waitForTurnstileToken(page, timeoutSec = 10) {
-    for (let s = 0; s < timeoutSec; s++) {
-        const token = await getTurnstileToken(page);
-        if (token) { console.log(`   >> ✅ Turnstile token 已获取!`); return token; }
-
-        // 同时检查视觉 "Success!"
-        const frames = page.frames();
-        for (const f of frames) {
-            try { if (f.url().includes('cloudflare') && await f.getByText('Success!', { exact: false }).isVisible({ timeout: 300 })) { console.log('   >> ✅ Cloudflare: Success!'); return 'visual'; } }
-            catch (e) {}
-        }
-        await page.waitForTimeout(1000);
-    }
-    return null;
-}
-
 // 多策略 Turnstile 解决
 async function solveTurnstile(page) {
-    // 先检查是否已解决
-    let token = await getTurnstileToken(page);
-    if (token) { console.log('   >> Turnstile 已有 token，跳过。'); return true; }
-
-    // 策略 1：DOM 派发事件（可能绕过 isTrusted）
-    console.log('   >> [策略 1/3] DOM 派发...');
-    for (let i = 0; i < 5; i++) {
+    console.log('   >> [策略 1/2] DOM 派发...');
+    for (let i = 0; i < 3; i++) {
         if (await attemptTurnstileDOM(page)) {
-            token = await waitForTurnstileToken(page, 6);
-            if (token) { console.log('   >> ✅ 策略 1 成功！'); return true; }
+            const v = await waitForTurnstileVerified(page, 10);
+            if (v) { console.log('   >> ✅ 策略 1 成功！'); return true; }
         }
         await page.waitForTimeout(1000);
     }
 
-    // 策略 2：Playwright mouse（真人轨迹）
-    console.log('   >> [策略 2/3] 鼠标模拟...');
+    console.log('   >> [策略 2/2] 鼠标模拟...');
     for (let i = 0; i < 5; i++) {
         if (await attemptTurnstileMouse(page)) {
-            token = await waitForTurnstileToken(page, 6);
-            if (token) { console.log('   >> ✅ 策略 2 成功！'); return true; }
+            const v = await waitForTurnstileVerified(page, 12);
+            if (v) { console.log('   >> ✅ 策略 2 成功！'); return true; }
         }
         await page.waitForTimeout(1000);
     }
 
-    // 策略 3：CDP 点击（传统方式）
-    console.log('   >> [策略 3/3] CDP 点击...');
-    for (let i = 0; i < 5; i++) {
-        if (await attemptTurnstileCdp(page)) {
-            token = await waitForTurnstileToken(page, 6);
-            if (token) { console.log('   >> ✅ 策略 3 成功！'); return true; }
-        }
-        await page.waitForTimeout(1000);
-    }
-
-    // 最后一次检查
-    token = await getTurnstileToken(page);
-    return !!token;
+    return false;
 }
 
 async function navigateToServerEdit(page, user) {
@@ -366,7 +316,6 @@ async function navigateToServerEdit(page, user) {
         try {
             if (page.isClosed()) { page = await context.newPage(); await page.addInitScript(INJECTED_SCRIPT); }
 
-            // === 登录（带重试） ===
             let loginSuccess = false;
             for (let la = 1; la <= 3; la++) {
                 console.log(`\n[登录尝试 ${la}/3]`);
@@ -386,10 +335,13 @@ async function navigateToServerEdit(page, user) {
                     } else {
                         console.log('   >> 登录页 Turnstile，多策略解决...');
                         if (!(await solveTurnstile(page))) {
-                            console.log(`   >> ⚠️ 所有策略均未能获取 token（尝试 ${la}/3）`);
+                            console.log(`   >> ⚠️ 验证失败（尝试 ${la}/3）`);
                             await page.reload(); await page.waitForTimeout(2000); continue;
                         }
                     }
+
+                    // 验证通过后，额外等 2 秒让页面完全响应
+                    await page.waitForTimeout(2000);
 
                     await page.getByRole('button', { name: 'Login', exact: true }).click();
                     await page.waitForTimeout(4000);
@@ -412,7 +364,6 @@ async function navigateToServerEdit(page, user) {
             if (!loginSuccess) { console.log('   >> 登录最终失败，跳过。'); continue; }
             if (!(await navigateToServerEdit(page, user))) { console.log('   >> 导航失败，跳过。'); continue; }
 
-            // === Renew ===
             let renewSuccess = false;
             for (let attempt = 1; attempt <= 20; attempt++) {
                 let hasCaptchaError = false;
